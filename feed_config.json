@@ -1,0 +1,42 @@
+{
+  "ai": {
+    "primary": {
+      "http://export.arxiv.org/rss/cs.AI": true,
+      "http://export.arxiv.org/rss/cs.LG": true,
+      "http://export.arxiv.org/rss/cs.CL": true,
+      "http://export.arxiv.org/rss/cs.CV": true,
+      "http://export.arxiv.org/rss/cs.NE": true
+    },
+    "secondary": {
+      "https://blog.research.google/feeds/posts/default": false,
+      "https://openai.com/api/v1/blog/feed": false,
+      "https://aws.amazon.com/blogs/machine-learning/feed/": false,
+      "https://techcommunity.microsoft.com/t5/ai-machine-learning-blog/rss": false,
+      "https://engineering.fb.com/feed/": false
+    }
+  },
+  "crypto": {
+    "primary": {
+      "https://www.theblock.co/rss.xml": true,
+      "https://blog.kraken.com/feed": true,
+      "https://messari.io/rss": true,
+      "https://blockworks.co/feed": true,
+      "https://www.coinbureau.com/feed/": true
+    },
+    "secondary": {
+      "https://cointelegraph.com/rss": false,
+      "https://cryptonews.com/news/feed/": false,
+      "https://decrypt.co/feed": false,
+      "https://news.bitcoin.com/feed/": false,
+      "https://coindesk.com/arc/outboundfeeds/rss/": true,
+      "https://bitcoinmagazine.com/.rss/full/": false,
+      "https://cryptopotato.com/feed/": false,
+      "https://ambcrypto.com/feed/": false,
+      "https://newsbtc.com/feed/": false,
+      "https://cryptoslate.com/feed/": false,
+      "https://beincrypto.com/feed/": false,
+      "https://bitcoinist.com/feed/": false,
+      "https://dailyhodl.com/feed/": false
+    }
+  }
+}
