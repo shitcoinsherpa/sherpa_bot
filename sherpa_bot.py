@@ -138,10 +138,8 @@ class EncryptionManager:
     def __init__(self):
         self.key = None
         print("Initializing EncryptionManager...")
-class EncryptionManager:
-    def __init__(self):
-        self.key = None
-        print("Initializing EncryptionManager...")
+
+        # Load the encryption key if it exists
         if os.path.exists(ENCRYPTION_KEY_FILE):
             try:
                 with open(ENCRYPTION_KEY_FILE, 'rb') as f:
@@ -151,70 +149,14 @@ class EncryptionManager:
                     print("Successfully created Fernet cipher")
             except Exception as e:
                 print(f"Error loading encryption key: {e}")
-                import traceback
-                traceback.print_exc()  # Provide more details about the error
+                traceback.print_exc()
                 self.key = None
 
-        # Validate the key and its decryption
+        # Validate the encryption key
         if self.key:
-            try:
-                test_cipher = Fernet(self.key)
-                test_message = b"Test message for encryption validation"
-                encrypted_message = test_cipher.encrypt(test_message)
-                decrypted_message = test_cipher.decrypt(encrypted_message)
-                assert test_message == decrypted_message, "Decrypted message does not match original"
-                print("Encryption key validation passed.")
-            except Exception as validation_error:
-                print(f"Encryption key validation failed: {validation_error}")
-                import traceback
-                traceback.print_exc()
+            self.validate_key()
 
-
-# Validate the key and its decryption
-if self.key:
-    try:
-        test_cipher = Fernet(self.key)
-        test_message = b"Test message for encryption validation"
-        encrypted_message = test_cipher.encrypt(test_message)
-        decrypted_message = test_cipher.decrypt(encrypted_message)
-        assert test_message == decrypted_message, "Decrypted message does not match original"
-        print("Encryption key validation passed.")
-    except Exception as validation_error:
-        print(f"Encryption key validation failed: {validation_error}")
-        import traceback
-        traceback.print_exc()
-
-
-# Validate the key and its decryption
-if self.key:
-    try:
-        test_cipher = Fernet(self.key)
-        test_message = b"Test message for encryption validation"
-        encrypted_message = test_cipher.encrypt(test_message)
-        decrypted_message = test_cipher.decrypt(encrypted_message)
-        assert test_message == decrypted_message, "Decrypted message does not match original"
-        print("Encryption key validation passed.")
-    except Exception as validation_error:
-        print(f"Encryption key validation failed: {validation_error}")
-        import traceback
-        traceback.print_exc()
-
-
-# Validate the key and its decryption
-if self.key:
-    try:
-        test_cipher = Fernet(self.key)
-        test_message = b"Test message for encryption validation"
-        encrypted_message = test_cipher.encrypt(test_message)
-        decrypted_message = test_cipher.decrypt(encrypted_message)
-        assert test_message == decrypted_message, "Decrypted message does not match original"
-        print("Encryption key validation passed.")
-    except Exception as validation_error:
-        print(f"Encryption key validation failed: {validation_error}")
-        import traceback
-        traceback.print_exc()
-
-        
+        # Generate a new key if none exists
         if not self.key:
             print("Generating new encryption key...")
             self.key = Fernet.generate_key()
@@ -225,7 +167,19 @@ if self.key:
                 print("Successfully generated and saved new key")
             except Exception as e:
                 print(f"Error saving new encryption key: {e}")
-    
+
+    def validate_key(self):
+        try:
+            test_cipher = Fernet(self.key)
+            test_message = b"Test message for encryption validation"
+            encrypted_message = test_cipher.encrypt(test_message)
+            decrypted_message = test_cipher.decrypt(encrypted_message)
+            assert test_message == decrypted_message, "Decrypted message does not match original"
+            print("Encryption key validation passed.")
+        except Exception as validation_error:
+            print(f"Encryption key validation failed: {validation_error}")
+            traceback.print_exc()
+
     def encrypt(self, data):
         try:
             json_data = json.dumps(data)
@@ -236,7 +190,7 @@ if self.key:
         except Exception as e:
             print(f"Error encrypting data: {e}")
             return None
-    
+
     def decrypt(self, encrypted_data):
         try:
             print(f"Attempting to decrypt data, length: {len(encrypted_data)} bytes")
@@ -247,9 +201,11 @@ if self.key:
             return json_data
         except Exception as e:
             print(f"Error decrypting data: {e}")
-            import traceback
             traceback.print_exc()
             return {}
+
+if __name__ == "__main__":
+    manager = EncryptionManager()
 
 class CryptoArticle:
     def __init__(self, title, preview, full_text, link, published_date):
