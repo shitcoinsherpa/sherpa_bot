@@ -138,16 +138,33 @@ class EncryptionManager:
     def __init__(self):
         self.key = None
         print("Initializing EncryptionManager...")
-        if os.path.exists(ENCRYPTION_KEY_FILE):
-            try:
-                with open(ENCRYPTION_KEY_FILE, 'rb') as f:
-                    self.key = f.read()
-                    print(f"Loaded encryption key, length: {len(self.key)} bytes")
-                    self.cipher = Fernet(self.key)
-                    print("Successfully created Fernet cipher")
-            except Exception as e:
-                print(f"Error loading encryption key: {e}")
-                self.key = None
+     if os.path.exists(ENCRYPTION_KEY_FILE):
+    try:
+        with open(ENCRYPTION_KEY_FILE, 'rb') as f:
+            self.key = f.read()
+            print(f"Loaded encryption key, length: {len(self.key)} bytes")
+            self.cipher = Fernet(self.key)
+            print("Successfully created Fernet cipher")
+    except Exception as e:
+        print(f"Error loading encryption key: {e}")
+        import traceback
+        traceback.print_exc()  # Provide more details about the error
+        self.key = None
+
+# Validate the key and its decryption
+if self.key:
+    try:
+        test_cipher = Fernet(self.key)
+        test_message = b"Test message for encryption validation"
+        encrypted_message = test_cipher.encrypt(test_message)
+        decrypted_message = test_cipher.decrypt(encrypted_message)
+        assert test_message == decrypted_message, "Decrypted message does not match original"
+        print("Encryption key validation passed.")
+    except Exception as validation_error:
+        print(f"Encryption key validation failed: {validation_error}")
+        import traceback
+        traceback.print_exc()
+
         
         if not self.key:
             print("Generating new encryption key...")
