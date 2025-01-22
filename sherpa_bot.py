@@ -138,6 +138,8 @@ class EncryptionManager:
     def __init__(self):
         self.key = None
         print("Initializing EncryptionManager...")
+
+        # Load the encryption key if it exists
         if os.path.exists(ENCRYPTION_KEY_FILE):
             try:
                 with open(ENCRYPTION_KEY_FILE, 'rb') as f:
@@ -147,8 +149,14 @@ class EncryptionManager:
                     print("Successfully created Fernet cipher")
             except Exception as e:
                 print(f"Error loading encryption key: {e}")
+                traceback.print_exc()
                 self.key = None
-        
+
+        # Validate the encryption key
+        if self.key:
+            self.validate_key()
+
+        # Generate a new key if none exists
         if not self.key:
             print("Generating new encryption key...")
             self.key = Fernet.generate_key()
@@ -159,7 +167,19 @@ class EncryptionManager:
                 print("Successfully generated and saved new key")
             except Exception as e:
                 print(f"Error saving new encryption key: {e}")
-    
+
+    def validate_key(self):
+        try:
+            test_cipher = Fernet(self.key)
+            test_message = b"Test message for encryption validation"
+            encrypted_message = test_cipher.encrypt(test_message)
+            decrypted_message = test_cipher.decrypt(encrypted_message)
+            assert test_message == decrypted_message, "Decrypted message does not match original"
+            print("Encryption key validation passed.")
+        except Exception as validation_error:
+            print(f"Encryption key validation failed: {validation_error}")
+            traceback.print_exc()
+
     def encrypt(self, data):
         try:
             json_data = json.dumps(data)
@@ -170,7 +190,7 @@ class EncryptionManager:
         except Exception as e:
             print(f"Error encrypting data: {e}")
             return None
-    
+
     def decrypt(self, encrypted_data):
         try:
             print(f"Attempting to decrypt data, length: {len(encrypted_data)} bytes")
@@ -181,9 +201,11 @@ class EncryptionManager:
             return json_data
         except Exception as e:
             print(f"Error decrypting data: {e}")
-            import traceback
             traceback.print_exc()
             return {}
+
+if __name__ == "__main__":
+    manager = EncryptionManager()
 
 class CryptoArticle:
     def __init__(self, title, preview, full_text, link, published_date):
@@ -1437,7 +1459,13 @@ def create_ui():
             gr.Markdown("Generate and post tweets using your AI characters")
             
             with gr.Row():
-                character_dropdown = gr.Dropdown(choices=list(bot.characters.keys()), value=next(iter(bot.characters.keys())), label="Select Character")
+                character_dropdown = gr.Dropdown(
+    choices=list(bot.characters.keys()), 
+    value=None if not bot.characters else next(iter(bot.characters.keys())), 
+    label="Select Character",
+    interactive=bool(bot.characters)  # Disable if no characters
+)
+
                 subject_dropdown = gr.Dropdown(choices=["crypto", "ai"], value="crypto", label="Select Subject")
             
             with gr.Row():
