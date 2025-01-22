@@ -1459,7 +1459,13 @@ def create_ui():
             gr.Markdown("Generate and post tweets using your AI characters")
             
             with gr.Row():
-                character_dropdown = gr.Dropdown(choices=list(bot.characters.keys()), value=next(iter(bot.characters.keys())), label="Select Character")
+                character_dropdown = gr.Dropdown(
+    choices=list(bot.characters.keys()), 
+    value=None if not bot.characters else next(iter(bot.characters.keys())), 
+    label="Select Character",
+    interactive=bool(bot.characters)  # Disable if no characters
+)
+
                 subject_dropdown = gr.Dropdown(choices=["crypto", "ai"], value="crypto", label="Select Subject")
             
             with gr.Row():
