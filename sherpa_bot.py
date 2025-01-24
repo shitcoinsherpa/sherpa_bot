@@ -308,7 +308,84 @@ class TwitterBot:
             print(f"Error loading characters: {e}")
             import traceback
             traceback.print_exc()
-            return {}
+            return {} 
+    
+    def load_character_prompt(char_name):
+        if not char_name:
+            return ""
+        return bot.characters.get(char_name, {}).get('prompt', "")  
+    
+     # Get default character prompt
+    character_prompt = gr.Textbox(
+        label="Character System Prompt",
+        lines=5,
+        placeholder="Enter the system prompt that defines this character's personality...",
+        value="",
+        show_label=True,
+        container=True,
+        scale=1,
+        interactive=True,
+    )
+
+    def get_assistant_details(self, assistant_id):
+        """Fetch assistant details from OpenAI API v2"""
+        try:
+            if not self.client:
+                return None, "OpenAI client not initialized. Please check your API key."
+
+            headers = {
+                "Authorization": f"Bearer {self.client.api_key}",
+                "OpenAI-Beta": "assistants=v2"
+            }
+            url = f"https://api.openai.com/v1/assistants/{assistant_id}"
+
+            print(f"Fetching assistant from URL: {url}")  # Log the URL
+            response = httpx.get(url, headers=headers)
+
+            print(f"Response status code: {response.status_code}") # Log status code
+            print(f"Response headers: {response.headers}") # Log headers
+            print(f"Response content: {response.text}") # Log content
+
+            if response.status_code == 200:
+                try:
+                    assistant = response.json()
+                    print(f"Successfully fetched assistant: {assistant.get('id')}") # Log successful fetch
+                    print(f"Assistant Dictionary Structure: {assistant}") # Print the dictionary
+                    return assistant, None
+                except json.JSONDecodeError:
+                    return None, "Error: Response is not valid JSON. Check response content."
+            else:
+                try:
+                    error_message = response.json().get('error', {}).get('message', 'Unknown error')
+                except json.JSONDecodeError:
+                    error_message = f"Unknown error - Non-JSON response: {response.text}"
+                return None, f"Error fetching assistant: Error code: {response.status_code} - {error_message}"
+
+        except httpx.RequestError as e:
+            return None, f"Request error: {e}"
+        except Exception as e:
+            return None, f"General error fetching assistant: {str(e)}"
+    
+    def save_character_from_assistant(self, name, assistant_id):
+        """Create a character from an OpenAI assistant"""
+        try:
+            assistant, error = self.get_assistant_details(assistant_id)
+            if error:
+                return False, error
+            
+            characters = self.characters.copy()
+            characters[name] = {
+                'prompt': assistant['instructions'],
+                'model': assistant['model'],
+                'assistant_id': assistant_id  # Store the assistant ID for future reference
+            }
+            
+            if self.save_characters(characters):
+                return True, "Character created successfully from assistant"
+            return False, "Failed to save character"
+            
+        except Exception as e:
+            return False, f"Error creating character: {str(e)}"    
     
     def save_credentials(self, credentials):
         print("\nSaving credentials to file...")
@@ -1154,10 +1231,7 @@ def create_ui():
         'twitter_access_token': bot.credentials.get('twitter_access_token', ''),
         'twitter_access_token_secret': bot.credentials.get('twitter_access_token_secret', '')
     }
-    
-    # Get default character prompt
-    default_prompt = next(iter(bot.characters.values()))['prompt'] if bot.characters else ""
-    
+
     with gr.Blocks(theme=gr.themes.Soft(
         primary_hue="green",
         secondary_hue="green",
@@ -1296,57 +1370,159 @@ def create_ui():
                 outputs=[save_status, openai_key, twitter_api_key, twitter_api_secret,
                         twitter_access_token, twitter_access_token_secret]
             )
-        
         print("\nInitializing character management components...")
         with gr.Accordion("👤 Character Management", open=True):
             gr.Markdown("Create and manage your AI characters")
-            
-            # Get list of characters and set default
+
+            # Get list of characters and set default (moved to top)
             char_choices = list(bot.characters.keys())
-            default_char = next(iter(bot.characters.keys())) if char_choices else None
-            
-            control_character = gr.Dropdown(
-                label="Select Character",
-                choices=char_choices,
-                value=default_char,
-                interactive=True
-            )
+            default_char = None
             
             with gr.Row():
-                character_name = gr.Textbox(
-                    label="Character Name",
-                    show_label=True,
-                    container=True,
-                    scale=1,
+                control_character = gr.Dropdown(
+                    label="Character",
+                    choices=char_choices,
+                    value=default_char,
                     interactive=True,
-                    placeholder="Enter character name..."
-                )
-            
-            with gr.Row():
-                character_prompt = gr.Textbox(
-                    label="Character System Prompt",
-                    lines=5,
-                    placeholder="Enter the system prompt that defines this character's personality...",
                     show_label=True,
                     container=True,
                     scale=1,
+                    allow_custom_value=False # Should not allow custom values here
+                )
+                character_select_button = gr.Button("Select Character", variant="primary")
+            
+            with gr.Row():
+                delete_char_dropdown = gr.Dropdown(
+                    label="Select character to delete",
+                    choices=char_choices,
+                    value=default_char,
                     interactive=True,
-                    value=default_prompt
-                )
-            
-            with gr.Row():
-                model_dropdown = gr.Dropdown(
-                    label="Select Model",
-                    choices=list(OPENAI_MODELS.keys()),
-                    value=next((k for k, v in OPENAI_MODELS.items() 
-                              if bot.characters and v['name'] == next(iter(bot.characters.values()))['model']), 
-                              "gpt-3.5-turbo (Most affordable)"),
                     show_label=True,
                     container=True,
                     scale=1,
-                    interactive=True
+                    allow_custom_value=True
                 )
-                print(f"Model dropdown initialized with choices: {list(OPENAI_MODELS.keys())}")
+                delete_button = gr.Button("Delete Character", variant="secondary")
+
+            with gr.Tabs():
+                with gr.TabItem("Manual Creation"):
+                    with gr.Row():
+                        character_name = gr.Textbox(
+                            label="Character Name",
+                            show_label=True,
+                            container=True,
+                            scale=1,
+                            interactive=True,
+                            placeholder="Enter character name..."
+                        )
+                    
+                    with gr.Row():
+                        character_prompt = gr.Textbox(
+                            label="Character System Prompt",
+                            lines=5,
+                            placeholder="Enter the system prompt that defines this character's personality...",
+                            show_label=True,
+                            container=True,
+                            scale=1,
+                            interactive=True,
+                            value="",
+                        )
+                    
+                    with gr.Row():
+                        model_dropdown = gr.Dropdown(
+                            label="Select Model",
+                            choices=list(OPENAI_MODELS.keys()),
+                            value=next((k for k, v in OPENAI_MODELS.items() 
+                                    if bot.characters and v['name'] == next(iter(bot.characters.values()))['model']), 
+                                    "gpt-3.5-turbo (Most affordable)"),
+                            show_label=True,
+                            container=True,
+                            scale=1,
+                            interactive=True
+                        )
+                        print(f"Model dropdown initialized with choices: {list(OPENAI_MODELS.keys())}")
+
+                with gr.TabItem("Import from Assistant"):
+                    with gr.Row():
+                        assistant_char_name = gr.Textbox(
+                            label="Character Name",
+                            show_label=True,
+                            container=True,
+                            scale=1,
+                            interactive=True,
+                            placeholder="Enter character name..."
+                        )
+                        
+                        assistant_id = gr.Textbox(
+                            label="OpenAI Assistant ID",
+                            show_label=True,
+                            container=True,
+                            scale=1,
+                            interactive=True,
+                            placeholder="asst_..."
+                        )
+                    
+                    with gr.Row():
+                        import_assistant_btn = gr.Button("Import Assistant", variant="primary")
+                        import_status = gr.Textbox(label="Import Status", interactive=False)
+                    
+                    def import_assistant(name, asst_id):
+                        if not name or not asst_id:
+                            return ("Name and Assistant ID are required",
+                                   list(bot.characters.keys()),
+                                   None,
+                                   list(bot.characters.keys()))
+                        
+                        success, message = bot.save_character_from_assistant(name, asst_id)
+                        if success:
+                            new_choices = list(bot.characters.keys())
+                            return (message,
+                                   gr.update(choices=new_choices, value=name),  # delete_char_dropdown
+                                   name,         # character_name
+                                   gr.update(choices=new_choices, value=name))  # control_character
+                        else:
+                            return (message,
+                                   list(bot.characters.keys()),
+                                   None,
+                                   list(bot.characters.keys()))
+                    
+                    import_assistant_btn.click(
+                        import_assistant,
+                        inputs=[assistant_char_name, assistant_id],
+                        outputs=[import_status, delete_char_dropdown, character_name, 
+                                control_character]
+                    )
+
+            def delete_character(char_name):
+                print(f"\nDeleting character: {char_name}")
+                if not char_name:
+                    return ("Please select a character to delete",
+                           list(bot.characters.keys()),
+                           "",
+                           None,
+                           list(bot.characters.keys()))
+                print(f"Current characters before deletion: {list(bot.characters.keys())}")
+
+                characters = bot.characters.copy()
+                if char_name in characters:
+                    del characters[char_name]
+                    if bot.save_characters(characters):
+                        print(f"Character deleted successfully. Remaining characters: {list(bot.characters.keys())}")
+                        new_choices = list(bot.characters.keys())
+                        return ("Character deleted successfully",
+                               gr.update(choices=new_choices, value=None),  # delete_char_dropdown
+                               "",
+                               None,         # character_name
+                               gr.update(choices=new_choices, value=None))  # control_character
+                else: 
+                    print(f"Character '{char_name}' not found in characters list.")
+                
+                print("Failed to delete character")
+                return ("Failed to delete character",
+                       list(bot.characters.keys()),
+                       "",
+                       None,
+                       list(bot.characters.keys()))
             
             def save_character(name, prompt, model_name):
                 print(f"\nSaving character: {name}")
@@ -1368,9 +1544,9 @@ def create_ui():
                     # Update all character dropdowns
                     new_choices = list(bot.characters.keys())
                     return ("Character saved successfully", 
-                           new_choices,  # delete_char_dropdown
-                           name,         # character_name
-                           new_choices,  # control_character
+                           gr.update(choices=new_choices),  # delete_char_dropdown
+                           name,        # character_name
+                           gr.update(choices=new_choices),  # control_character
                            name)         # control_character value
                 else:
                     print("Failed to save character")
@@ -1383,61 +1559,41 @@ def create_ui():
             with gr.Row():
                 save_char_button = gr.Button("Add Character", variant="primary")
                 save_char_status = gr.Textbox(label="Status", interactive=False)
-            
-            with gr.Row():
-                delete_char_dropdown = gr.Dropdown(
-                    label="Select character to delete",
-                    choices=char_choices,
-                    value=default_char,
-                    interactive=True,
-                    show_label=True,
-                    container=True,
-                    scale=1,
-                    allow_custom_value=True
-                )
-                print(f"Delete character dropdown initialized with choices: {char_choices}")
-            
-            def delete_character(name):
-                print(f"\nDeleting character: {name}")
-                if not name:
-                    print("Error: No character selected")
-                    return "No character selected", [], None, [], None
-                
-                if name in bot.characters:
-                    characters = bot.characters.copy()
-                    del characters[name]
-                    
-                    if bot.save_characters(characters):
-                        new_choices = list(bot.characters.keys())
-                        new_default = next(iter(bot.characters)) if bot.characters else None
-                        print(f"Character deleted. Remaining: {new_choices}")
-                        print(f"New default character: {new_default}")
-                        return ("Character deleted successfully", 
-                               new_choices,  # delete_char_dropdown
-                               new_default,  # delete_char_dropdown value
-                               new_choices,  # control_character
-                               new_default)  # control_character value
-                    else:
-                        print("Failed to delete character")
-                        return ("Failed to delete character",
-                               list(bot.characters.keys()),
-                               name,
-                               list(bot.characters.keys()),
-                               name)
-                else:
-                    print("Character not found")
-                    return "Character not found", list(bot.characters.keys()), name, list(bot.characters.keys()), name
-            
-            with gr.Row():
-                delete_button = gr.Button("Delete Character", variant="secondary")
-                delete_status = gr.Textbox(label="Delete Status", interactive=False)
-            
-        # Control Center section
+
+                        # Connect character management event handlers
+            save_char_button.click(
+                save_character,
+                inputs=[character_name, character_prompt, model_dropdown],
+                outputs=[save_char_status, delete_char_dropdown, character_name, 
+                        control_character]
+            )
+
+            delete_char_dropdown.change(
+                bot.load_character_prompt,
+                inputs=[delete_char_dropdown],
+                outputs=[character_prompt]
+            ) 
+
+            # Connect delete button to handler
+            delete_button.click(
+                delete_character,
+                inputs=[delete_char_dropdown],
+                outputs=[save_char_status, delete_char_dropdown, character_name,
+                        control_character] # <-- And these outputs
+            )    
+         # Control Center section
         with gr.Accordion("🎮 Control Center", open=True):
             gr.Markdown("Generate and post tweets using your AI characters")
             
             with gr.Row():
-                character_dropdown = gr.Dropdown(choices=list(bot.characters.keys()), value=next(iter(bot.characters.keys())), label="Select Character")
+                # Add default handling for empty characters dictionary
+                new_choices = list(bot.characters.keys())
+                default_char = next(iter(bot.characters.keys())) if char_choices else None
+                character_dropdown = gr.Dropdown(
+                    choices=new_choices,
+                    value=default_char,
+                    label="Select Character"
+                )
                 subject_dropdown = gr.Dropdown(choices=["crypto", "ai"], value="crypto", label="Select Subject")
             
             with gr.Row():
@@ -1544,21 +1700,6 @@ def create_ui():
                 inputs=[character_dropdown, current_topic],
                 outputs=[tweet_status]
             )
-        
-        # Register character management event handlers
-        save_char_button.click(
-            save_character,
-            inputs=[character_name, character_prompt, model_dropdown],
-            outputs=[save_char_status, delete_char_dropdown, character_name, 
-                    control_character, character_dropdown]
-        )
-        
-        delete_button.click(
-            delete_character,
-            inputs=[delete_char_dropdown],
-            outputs=[delete_status, delete_char_dropdown, delete_char_dropdown,
-                    control_character, character_dropdown]
-        )
         
         # Feed Configuration section
         with gr.Accordion("📰 Feed Configuration", open=True):

@@ -7,9 +7,9 @@ beautifulsoup4==4.12.2
 html2text==2020.1.16
 cryptography==41.0.7
 requests==2.31.0
-fastapi>=0.104.1
-uvicorn>=0.24.0
-python-multipart>=0.0.6
-typing-extensions>=4.8.0
-pydantic>=2.5.2
-httpx>=0.25.2 
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.9
+typing-extensions==4.12.2
+pydantic==2.5.2
+httpx==0.25.2 
