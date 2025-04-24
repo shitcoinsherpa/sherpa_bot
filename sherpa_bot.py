@@ -897,7 +897,11 @@ class TwitterBot:
                     print("\nTweet sent successfully")
                     print(f"Tweet ID: {response.data['id']}")
                     print(f"Response data: {response.data}")
-                    
+                    tweet_id = response.data['id']
+username = self.credentials.get("twitter_username", "Fantasia_VHS")  # or your actual username
+tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+self.send_to_telegram(tweet_url)
+
                     # Update rate limit tracking
                     self.update_rate_limit()
                     return True
