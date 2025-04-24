@@ -1112,6 +1112,28 @@ class TwitterBot:
         except Exception as e:
             print(f"Error sending tweet with media: {e}")
             return False
+            
+    def send_to_telegram(self, tweet_url):
+    bot_token = self.credentials.get("telegram_bot_token")
+    chat_id = self.credentials.get("telegram_chat_id")
+
+    if not bot_token or not chat_id:
+        print("⚠️ Telegram credentials missing")
+        return
+
+    text = f"Mork has tweeted:\n{tweet_url}"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    try:
+        response = requests.post(url, data=payload)
+        print("📨 Telegram status:", response.status_code, response.text)
+    except Exception as e:
+        print(f"❌ Telegram send failed: {e}")
     
 def save_feed_selection(subject, primary_selected, secondary_selected):
     """Save the selected feeds configuration"""
