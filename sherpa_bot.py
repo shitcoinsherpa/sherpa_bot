@@ -1112,6 +1112,20 @@ class TwitterBot:
         except Exception as e:
             print(f"Error sending tweet with media: {e}")
             return False
+    def send_to_telegram(self, tweet_url):
+    bot_token = "7934522768:AAHEvTQdokBReA6819_KAMz6gVkbJU2znH8"
+    chat_id = "-1002139696964"
+    text = f"Mork has spoken:\n{tweet_url}"
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    response = requests.post(url, data=payload)
+    print("Telegram status:", response.status_code, response.text)
 
 def save_feed_selection(subject, primary_selected, secondary_selected):
     """Save the selected feeds configuration"""
