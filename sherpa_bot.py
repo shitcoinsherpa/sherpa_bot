@@ -8,7 +8,7 @@ import json
 import threading
 import queue
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from cryptography.fernet import Fernet
 from pathlib import Path
 import requests
@@ -238,7 +238,8 @@ class TwitterBot:
         self.feed_last_used = {}  # Track when each feed was last used
         self.last_successful_tweet = None
         self.twitter_client = None  # Initialize Twitter client as None
-        
+        self.backoff_until = None
+
         # Initialize meme-related variables
         self.use_memes = False
         self.meme_counter = 0
@@ -698,40 +699,62 @@ class TwitterBot:
             # Remove the "Read more: URL" part from the topic
             clean_topic = re.sub(r'\n\nRead more: https?://\S+', '', topic)
 
-            # Twitter will automatically shorten URLs to ~23 characters with t.co
-            # But we need to include the full URL at the end for proper link previews
-            # Add 1 for the space before the URL
+            # Calculate character limit
             TWITTER_SHORT_URL_LENGTH = 24
             max_content_length = 280 - TWITTER_SHORT_URL_LENGTH if article_url else 280
 
+            # 🔀 Add variation to prompt tone
+            prompt_variants = [
+                "Speak as if you're writing a soliloquy for a tragic sauce-themed play.",
+                "Add a sprinkle of literary irony, but make it savory.",
+                "Pretend to be distracted.",
+                "Imagine you're writing from exile in a forgotten condiment aisle.",
+                "Use language that suggests you're the last philosopher alive.",
+                "Add an unexpected culinary metaphor, ideally involving vinegar or smoke.",
+                "Maintain melancholy but make it tastefully funny.",
+                "Respond as if the conversation was with a long lost friend.",
+                "End with an awkward outro.",
+            ]
+            hour = datetime.now().hour
+            if hour < 12:
+                prompt_variants.append("Start with morning gloom, like breakfast with no sauce.")
+            elif hour > 20:
+                prompt_variants.append("Make it sound like a sauce-stained midnight confession.")
+
+            variation = random.choice(prompt_variants)
+
+            # 🧠 Compose the prompt
+            messages = [
+                {"role": "system", "content": character['prompt']},
+                {"role": "user", "content": f"{variation}\n\nCreate a tweet about this topic that is EXACTLY {max_content_length} characters or less. Make it engaging and maintain character voice. NO hashtags, emojis, or URLs - I'll add the URL later. Topic: {clean_topic}"}
+            ]
+
             response = self.client.chat.completions.create(
                 model=character['model'],
-                messages=[
-                    {"role": "system", "content": character['prompt']},
-                    {"role": "user", "content": f"Create a tweet about this topic that is EXACTLY {max_content_length} characters or less. Make it engaging and maintain character voice. NO hashtags, emojis, or URLs - I'll add the URL later. Topic: {clean_topic}"}
-                ],
+                messages=messages,
                 max_tokens=200,
                 temperature=1.0,
                 presence_penalty=0.6,
                 frequency_penalty=0.6
             )
-            
+
             tweet_text = response.choices[0].message.content.strip()
-            
+
             # Clean up quotation marks if present
             if tweet_text and len(tweet_text) >= 2:
                 if (tweet_text[0] == '"' and tweet_text[-1] == '"') or \
-                   (tweet_text[0] == "'" and tweet_text[-1] == "'"):
+                (tweet_text[0] == "'" and tweet_text[-1] == "'"):
                     tweet_text = tweet_text[1:-1].strip()
-            
+
             # If tweet content is too long, try one more time with stricter length
             if len(tweet_text) > max_content_length:
+                retry_messages = [
+                    {"role": "system", "content": character['prompt']},
+                    {"role": "user", "content": f"{variation}\n\nCreate a SHORTER tweet about this topic, maximum {max_content_length} characters. Be concise but maintain personality. NO hashtags, emojis, or URLs. Topic: {clean_topic}"}
+                ]
                 response = self.client.chat.completions.create(
                     model=character['model'],
-                    messages=[
-                        {"role": "system", "content": character['prompt']},
-                        {"role": "user", "content": f"Create a SHORTER tweet about this topic, maximum {max_content_length} characters. Be concise but maintain personality. NO hashtags, emojis, or URLs. Topic: {clean_topic}"}
-                    ],
+                    messages=retry_messages,
                     max_tokens=200,
                     temperature=1.0,
                     presence_penalty=0.6,
@@ -740,31 +763,33 @@ class TwitterBot:
                 tweet_text = response.choices[0].message.content.strip()
                 if tweet_text and len(tweet_text) >= 2:
                     if (tweet_text[0] == '"' and tweet_text[-1] == '"') or \
-                       (tweet_text[0] == "'" and tweet_text[-1] == "'"):
+                    (tweet_text[0] == "'" and tweet_text[-1] == "'"):
                         tweet_text = tweet_text[1:-1].strip()
-            
-            # If still too long, truncate intelligently
+
+            # Truncate if still too long
             if len(tweet_text) > max_content_length:
-                # Find the last sentence that fits
                 sentences = re.split(r'(?<=[.!?])\s+', tweet_text)
                 truncated_text = ""
                 for sentence in sentences:
-                    if len(truncated_text + sentence) + 1 <= max_content_length:  # +1 for space
+                    if len(truncated_text + sentence) + 1 <= max_content_length:
                         truncated_text += " " + sentence if truncated_text else sentence
                     else:
                         break
                 tweet_text = truncated_text.strip()
-            
-            # Add the article URL at the end for proper preview
+
+            # Append the article URL at the end
             if article_url:
                 tweet_text = f"{tweet_text} {article_url}"
-            
+
             self.tweet_count += 1
             self.last_tweet_time = datetime.now()
-            
+
             return tweet_text
+
         except Exception as e:
-            print(f"Error generating tweet: {e}")
+            import traceback
+            print(f"❌ Error generating tweet:")
+            traceback.print_exc()
             return None
 
     def check_rate_limit(self):
@@ -859,15 +884,91 @@ class TwitterBot:
         print(f"\nUpdated rate limit count: {self.rate_limits['tweets']['current_count']}")
         print(f"Remaining in window: {self.rate_limits['tweets']['max_tweets'] - self.rate_limits['tweets']['current_count']}")
 
-    def send_tweet(self, tweet_text):
-        if not tweet_text or tweet_text == "Monthly tweet limit reached. Please wait for the next cycle.":
-            return False
+    def send_main_tweet(self):
+        """Send a main scheduled tweet."""
+        new_story = self.get_new_story("crypto")  # or "ai", depending on your subject
+        if new_story:
+            story_text = f"{new_story['title']}\n\n{new_story['preview']}\n\nRead more: {new_story['url']}"
+            tweet_text = self.generate_tweet("mork zuckerbarge", story_text)
+            if tweet_text:
+                if self.send_tweet(tweet_text):
+                    self.last_successful_tweet = datetime.now()
+                    print("✅ Main tweet sent successfully.")
+                else:
+                    print("❌ Failed to send main tweet.")
+
+    def reply_to_mentions_and_replies(self):
+        if self.backoff_until and datetime.now() < self.backoff_until:
+            print(f"⏳ Backoff active until {self.backoff_until}. Skipping mention/reply checking.")
+            return
+
+        print("🔍 Checking mentions and replies...")
+
+        replies_sent = 0
+        max_replies = 1
         
-        # Check rate limits first
+        print("🔍 Checking mentions and replies...")
+
+        replies_sent = 0
+        max_replies = 1
+
+        try:
+            mentions = self.twitter_client.get_users_mentions(self.mork_id, max_results=10)
+
+            if mentions.data:
+                for mention in mentions.data:
+                    if replies_sent >= max_replies:
+                        break
+                    if mention.author_id == self.mork_id:
+                        continue  # Skip replying to ourselves
+
+                    prompt = f"Someone mentioned you: \"{mention.text}\""
+                    reply = self.generate_tweet("mork zuckerbarge", prompt)
+
+                    if reply:
+                        self.twitter_client.create_tweet(
+                            text=reply,
+                            in_reply_to_tweet_id=mention.id
+                        )
+                        print(f"💬 Replied to {mention.id}")
+                        replies_sent += 1
+
+        except tweepy.TooManyRequests as e:
+            print("🚫 Rate limited! Setting global backoff...")
+
+            if hasattr(e, 'response') and e.response is not None:
+                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
+                if reset_timestamp:
+                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
+                    self.backoff_until = reset_time
+                    wait_seconds = (reset_time - datetime.now()).total_seconds()
+                    print(f"😴 Global backoff active until {self.backoff_until} (about {wait_seconds//60:.1f} min)")
+                    time.sleep(min(300, wait_seconds))  # Sleep max 5 min chunks so you can still process local stuff
+                    return False
+            else:
+                print("⚡ No reset time provided. Defaulting to 5 min backoff.")
+                self.backoff_until = datetime.now() + timedelta(minutes=5)
+                time.sleep(300)
+                return False
+
+
+        except Exception as e:
+            print(f"❌ Error replying to mentions: {e}")
+    def monitor_and_reply_to_engagement(self):
+        self.monitor_and_reply_to_mentions()
+
+    def send_tweet(self, tweet_text):
+        if self.backoff_until and datetime.now() < self.backoff_until:
+            print(f"⏳ Backoff active until {self.backoff_until}. Skipping sending tweet.")
+            return False
+
+    # (rest of your send_tweet code goes here...)
+
+
         if not self.check_rate_limit():
             print("Tweet skipped due to rate limit")
             return False
-        
+
         try:
             client = tweepy.Client(
                 consumer_key=self.credentials['twitter_api_key'],
@@ -876,72 +977,89 @@ class TwitterBot:
                 access_token_secret=self.credentials['twitter_access_token_secret'],
                 wait_on_rate_limit=True
             )
-            
+
             # Extract URL from tweet text and ensure it's at the end
             url_match = re.search(r'(https?://\S+)$', tweet_text)
             if url_match:
                 url = url_match.group(1)
-                # Remove URL from anywhere in the text and append at end
                 tweet_text = re.sub(r'\s*' + re.escape(url) + r'\s*', '', tweet_text).strip()
-                # Add a newline before the URL for better thumbnail display
                 tweet_text = f"{tweet_text}\n\n{url}"
-            
-            print(f"\nSending tweet: {tweet_text}")
-            
-            try:
-                # Send the tweet
-                response = client.create_tweet(text=tweet_text)
-                
-                if response.data:
-                    self.last_successful_tweet = datetime.now()
-                    print("\nTweet sent successfully")
-                    print(f"Tweet ID: {response.data['id']}")
-                    print(f"Response data: {response.data}")
-                    tweet_id = response.data['id']
-username = self.credentials.get("twitter_username", "Fantasia_VHS")  # or your actual username
-tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
-self.send_to_telegram(tweet_url)
 
-                    # Update rate limit tracking
-                    self.update_rate_limit()
-                    return True
-                
-                print("\nTweet failed - no response data")
-                print(f"Response object: {response}")
+            print(f"\nSending tweet: {tweet_text}")
+
+            response = client.create_tweet(text=tweet_text)
+
+            if response.data:
+                self.last_successful_tweet = datetime.now()
+                print("\nTweet sent successfully")
+                print(f"Tweet ID: {response.data['id']}")
+                print(f"Response data: {response.data}")
+
+                tweet_id = response.data['id']
+                username = self.credentials.get("twitter_username", "zuckerbarge")
+                tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+                self.send_to_telegram(tweet_url)
+
+                self.update_rate_limit()
+                return True
+
+            print("\nTweet failed - no response data")
+            return False
+
+        except Exception as e:
+            print(f"\nError sending tweet: {e}")
+            return False
+
+
+            # Update rate limit tracking
+            self.update_rate_limit()
+            return True
+            
+            print("\nTweet failed - no response data")
+            print(f"Response object: {response}")
+            return False
+            
+        except tweepy.TooManyRequests as e:
+            print("🚫 Rate limited! Checking Twitter reset time...")
+
+            if hasattr(e, 'response') and e.response is not None:
+                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
+                if reset_timestamp:
+                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
+                    now = datetime.now()
+                    wait_seconds = (reset_time - now).total_seconds()
+
+                    if wait_seconds > 0:
+                        print(f"😴 Sleeping for {wait_seconds//60:.1f} minutes until rate limit resets...")
+                        time.sleep(wait_seconds + 5)  # plus 5 second buffer
+                        return
+            else:
+                print("⚡ No reset time found. Sleeping 5 minutes as fallback.")
+                time.sleep(300)
+                return
+
+            
+        except tweepy.TooManyRequests as e:
+            print("🚫 Rate limited! Setting global backoff...")
+
+            if hasattr(e, 'response') and e.response is not None:
+                reset_timestamp = e.response.headers.get('x-rate-limit-reset')
+                if reset_timestamp:
+                    reset_time = datetime.fromtimestamp(int(reset_timestamp))
+                    self.backoff_until = reset_time
+                    wait_seconds = (reset_time - datetime.now()).total_seconds()
+                    print(f"😴 Global backoff active until {self.backoff_until} (about {wait_seconds//60:.1f} min)")
+                    time.sleep(min(300, wait_seconds))  # Sleep max 5 min chunks so you can still process local stuff
+                    return False
+            else:
+                print("⚡ No reset time provided. Defaulting to 5 min backoff.")
+                self.backoff_until = datetime.now() + timedelta(minutes=5)
+                time.sleep(300)
                 return False
-                
-            except tweepy.TooManyRequests as e:
-                print(f"\nRate limit exceeded: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                    reset_time = e.response.headers.get('x-rate-limit-reset')
-                    remaining = e.response.headers.get('x-rate-limit-remaining')
-                    limit = e.response.headers.get('x-rate-limit-limit')
-                    print(f"Rate limit details from headers:")
-                    print(f"  Remaining: {remaining}")
-                    print(f"  Limit: {limit}")
-                    if reset_time:
-                        reset_datetime = datetime.fromtimestamp(int(reset_time))
-                        print(f"  Reset time: {reset_datetime}")
-                return False
-                
-            except tweepy.TwitterServerError as e:
-                print(f"\nTwitter server error: {e}")
-                if hasattr(e, 'response') and e.response is not None:
-                    print(f"Response status: {e.response.status_code}")
-                    print(f"Response text: {e.response.text}")
-                    # Try to get rate limit info from headers
-                    remaining = e.response.headers.get('x-rate-limit-remaining')
-                    limit = e.response.headers.get('x-rate-limit-limit')
-                    reset_time = e.response.headers.get('x-rate-limit-reset')
-                    if any([remaining, limit, reset_time]):
-                        print(f"Rate limit details from headers:")
-                        print(f"  Remaining: {remaining}")
-                        print(f"  Limit: {limit}")
-                        if reset_time:
-                            reset_datetime = datetime.fromtimestamp(int(reset_time))
-                            print(f"  Reset time: {reset_datetime}")
-                return False
-                
+
+
+
+            
         except Exception as e:
             print(f"\nError sending tweet: {e}")
             import traceback
@@ -949,82 +1067,67 @@ self.send_to_telegram(tweet_url)
             return False
 
     def scheduler_worker(self):
-        print("\nStarting scheduler worker...")
-        
+        print("\n🛠️ Starting scheduler worker...")
+
+        # Persist character/subject for auto-refill later
+        self.scheduler_character = getattr(self, "scheduler_character", None)
+        self.scheduler_subject = getattr(self, "scheduler_subject", "crypto")
+
+        last_reply_check = time.time()
+        if not self.last_successful_tweet:
+            print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
+            self.last_successful_tweet = datetime.now()
+
         while self.scheduler_running:
             try:
-                current_time = time.time()
-                
-                # Check if enough time has passed since last tweet
-                if self.last_successful_tweet:
-                    time_since_last = (current_time - self.last_successful_tweet.timestamp())
-                    if time_since_last < TWEET_INTERVAL_HOURS * 3600:
-                        # Calculate exact sleep time needed
-                        sleep_time = (TWEET_INTERVAL_HOURS * 3600) - time_since_last
-                        # Break into smaller sleep intervals for more responsive shutdown
-                        while sleep_time > 0 and self.scheduler_running:
-                            time.sleep(min(60, sleep_time))
-                            sleep_time -= 60
-                        continue
-                
-                # Try to get a task from the queue
-                try:
-                    character_name, topic, subject = self.tweet_queue.get(timeout=1)
-                    print(f"\nGot task from queue for character: {character_name}")
-                    
-                    # Check if it's time for a meme
-                    if self.use_memes and (self.meme_counter >= self.meme_frequency or not self.last_successful_tweet):
-                        print("\nAttempting to send meme tweet...")
-                        tweet_text, meme_path = self.get_random_meme(character_name)
-                        if tweet_text and meme_path:
-                            if self.send_tweet_with_media(tweet_text, meme_path):
-                                self.meme_counter = 0  # Reset counter after successful meme
-                                self.last_successful_tweet = datetime.now()
-                                # Put the news topic back in queue for next tweet
-                                self.tweet_queue.put((character_name, topic, subject))
-                                continue
-                            else:
-                                print("Failed to send meme tweet, falling back to news")
-                    
-                    # If not time for meme or meme failed, proceed with news tweet
-                    tweet_text = self.generate_tweet(character_name, topic)
-                    if tweet_text:
-                        success = self.send_tweet(tweet_text)
-                        if success:
-                            print(f"Scheduled tweet sent successfully")
-                            self.last_successful_tweet = datetime.now()
-                            if self.use_memes:
-                                self.meme_counter += 1  # Increment meme counter
-                            
-                            # Add a delay before queuing next story
-                            time.sleep(5)
-                            
-                            # Queue up next story
-                            new_story = self.get_new_story(subject)
-                            if new_story:
-                                story_text = f"{new_story['title']}\n\n{new_story['preview']}\n\nRead more: {new_story['url']}"
-                                self.tweet_queue.put((character_name, story_text, subject))
-                                print(f"Queued next story from {new_story.get('source', 'unknown source')}")
-                        elif tweet_text == "Monthly tweet limit reached. Please wait for the next cycle.":
-                            print("Scheduler paused due to monthly tweet limit")
-                            time.sleep(3600)  # Wait an hour before checking again
-                        else:
-                            print("Tweet failed, will retry with new story")
-                            time.sleep(300)  # Wait 5 minutes before retrying
-                    
-                except queue.Empty:
-                    # If queue is empty, try to get a new story
-                    new_story = self.get_new_story(subject)  # Use last known subject
-                    if new_story:
-                        story_text = f"{new_story['title']}\n\n{new_story['preview']}\n\nRead more: {new_story['url']}"
-                        self.tweet_queue.put((character_name, story_text, subject))
-                        print(f"Added new story to queue from {new_story.get('source', 'unknown source')}")
-                    time.sleep(60)  # Wait before trying again
+                # Backoff check
+                if self.backoff_until and datetime.now() < self.backoff_until:
+                    wait_seconds = (self.backoff_until - datetime.now()).total_seconds()
+                    print(f"⏳ Backoff active until {self.backoff_until}. Sleeping {wait_seconds/60:.1f} minutes...")
+                    time.sleep(min(60, wait_seconds))
                     continue
-                    
+
+                current_time = time.time()
+
+                # Main tweet every 4 hours
+                if (datetime.now() - self.last_successful_tweet).total_seconds() >= (4 * 3600):
+                    print("\n⏰ 4 hours passed — preparing to send next tweet...")
+
+                    if not self.tweet_queue.empty():
+                        character, story_text, subject = self.tweet_queue.get()
+                        tweet_text = self.generate_tweet(character, story_text)
+                        if tweet_text and self.send_tweet(tweet_text):
+                            print("✅ Tweet from queue sent.")
+                            self.last_successful_tweet = datetime.now()
+
+                            # Queue up the next story
+                            next_story = self.get_new_story(subject)
+                            if next_story:
+                                next_text = f"{next_story['title']}\n\n{next_story['preview']}\n\nRead more: {next_story['url']}"
+                                self.tweet_queue.put((character, next_text, subject))
+                        else:
+                            print("❌ Failed to send tweet from queue.")
+                    else:
+                        print("📭 Tweet queue is empty — trying to refill...")
+                        next_story = self.get_new_story(self.scheduler_subject)
+                        if next_story:
+                            next_text = f"{next_story['title']}\n\n{next_story['preview']}\n\nRead more: {next_story['url']}"
+                            self.tweet_queue.put((self.scheduler_character, next_text, self.scheduler_subject))
+                            print("📥 Refilled tweet queue with a new story.")
+                        else:
+                            print("❌ Failed to get a new story. Queue remains empty.")
+
+                # Reply to mentions every 30 minutes
+                if (current_time - last_reply_check) >= (30 * 60):
+                    print("\n🔁 30 minutes passed — checking mentions and replies...")
+                    self.monitor_and_reply_to_engagement()
+                    last_reply_check = current_time
+
+                time.sleep(30)
+
             except Exception as e:
-                print(f"Error in scheduler worker: {e}")
-                time.sleep(60)  # Wait a minute before retrying
+                print(f"❌ Error in scheduler worker: {e}")
+                time.sleep(60)
 
     def get_random_meme(self, character_name):
         """Get a random meme and generate a contextual tweet based on the filename"""
@@ -1118,27 +1221,125 @@ self.send_to_telegram(tweet_url)
             return False
             
     def send_to_telegram(self, tweet_url):
-    bot_token = self.credentials.get("telegram_bot_token")
-    chat_id = self.credentials.get("telegram_chat_id")
+        bot_token = self.credentials.get("telegram_bot_token")
+        chat_id = self.credentials.get("telegram_chat_id")
 
-    if not bot_token or not chat_id:
-        print("⚠️ Telegram credentials missing")
-        return
+        if not bot_token or not chat_id:
+            print("⚠️ Telegram credentials missing")
+            return
 
-    text = f"Mork has tweeted:\n{tweet_url}"
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
+        text = f"Mork has tweeted:\n{tweet_url}"
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
 
-    try:
-        response = requests.post(url, data=payload)
-        print("📨 Telegram status:", response.status_code, response.text)
-    except Exception as e:
-        print(f"❌ Telegram send failed: {e}")
-    
+        try:
+            response = requests.post(url, data=payload)
+            print("📨 Telegram status:", response.status_code, response.text)
+        except Exception as e:
+            print(f"❌ Telegram send failed: {e}")
+    import requests  # Make sure you have this imported at top
+
+    def monitor_and_reply_to_mentions(self):
+        """Fetch mentions and intelligently reply up to 3 times."""
+        try:
+            print("\n🔍 Checking for Mork mentions and replies...")
+
+            bearer_token = self.credentials.get('bearer_token')
+            if not bearer_token:
+                print("❌ Bearer token missing. Cannot check mentions.")
+                return
+
+            headers = {
+                "Authorization": f"Bearer {bearer_token}"
+            }
+
+            user_info = self.twitter_client.get_me()
+            user_id = user_info.data.id
+
+            url = f"https://api.twitter.com/2/users/{user_id}/mentions"
+            params = {
+                "max_results": 10,  # be gentle
+                "tweet.fields": "author_id,text,created_at",
+            }
+
+            response = requests.get(url, headers=headers, params=params)
+
+            if response.status_code != 200:
+                print(f"❌ Error fetching mentions: {response.status_code} {response.text}")
+                return
+
+            mentions = response.json().get('data', [])
+
+            if not mentions:
+                print("ℹ️ No mentions found.")
+                return
+
+            print(f"📨 Found {len(mentions)} mentions.")
+
+            replies_sent = 0
+            max_replies = 1
+
+            for mention in mentions:
+                tweet_id = mention["id"]
+                tweet_text = mention["text"]
+                author_id = mention["author_id"]
+                created_at_str = mention.get("created_at")
+                if not created_at_str:
+                    print("⚠️ No timestamp found. Skipping.")
+                    continue
+
+                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                age = datetime.now(timezone.utc) - created_at
+
+                if age > timedelta(minutes=30):
+                    print(f"⏳ Skipping mention older than 30 minutes ({age}).")
+                    continue
+
+                print(f"\n🔎 Considering reply to: {tweet_text}")
+
+                # Filter low-quality tweets
+                if len(tweet_text.strip()) < 8:
+                    print("⚡ Skipping very short/low-effort mention.")
+                    continue
+
+                # Build OpenAI prompt
+                character = next(iter(self.characters.values()))
+                response = self.client.chat.completions.create(
+                    model=character['model'],
+                    messages=[
+                        {"role": "system", "content": character['prompt']},
+                        {"role": "user", "content": f"Reply to this mention in character: '{tweet_text}'"}
+                    ],
+                    max_tokens=180,
+                    temperature=0.9,
+                )
+
+                reply_text = response.choices[0].message.content.strip()
+
+                print(f"💬 Generated reply: {reply_text}")
+
+                self.twitter_client.create_tweet(
+                    text=reply_text,
+                    in_reply_to_tweet_id=tweet_id
+                )
+
+                print("✅ Sent reply.")
+
+                replies_sent += 1
+                if replies_sent >= max_replies:
+                    print("🎯 Max replies sent for this cycle.")
+                    break
+
+                time.sleep(random.uniform(5, 10))  # random small pause to look natural
+
+        except Exception as e:
+            print(f"❌ Fatal error in mention reply worker: {e}")
+
+
 def save_feed_selection(subject, primary_selected, secondary_selected):
     """Save the selected feeds configuration"""
     print(f"\nSaving feed selection for subject: {subject}")
@@ -1182,6 +1383,8 @@ def create_ui():
     print("\n=== Creating UI ===")
     global bot  # Make bot instance globally accessible
     bot = TwitterBot()
+    bot.last_successful_tweet = datetime.now()
+
     
     print("\nUI Initial State:")
     print(f"Credentials available: {list(bot.credentials.keys())}")
@@ -1238,6 +1441,26 @@ def create_ui():
                     gr.update(value=initial_values['twitter_access_token']),
                     gr.update(value=initial_values['twitter_access_token_secret'])
                 ]
+            with gr.Row():
+                telegram_bot_token = gr.Textbox(
+                    label="Telegram Bot Token",
+                    type="password",
+                    show_label=True,
+                    container=True,
+                    scale=1,
+                    interactive=True,
+                    value=bot.credentials.get('telegram_bot_token', '')
+                )
+
+                telegram_chat_id = gr.Textbox(
+                    label="Telegram Chat ID",
+                    type="text",
+                    show_label=True,
+                    container=True,
+                    scale=1,
+                    interactive=True,
+                    value=bot.credentials.get('telegram_chat_id', '')
+                )
             
             with gr.Row():
                 openai_key = gr.Textbox(
@@ -1296,8 +1519,19 @@ def create_ui():
                     value=initial_values['twitter_access_token_secret']
                 )
                 print(f"Twitter Access Token Secret textbox initialized")
-            
-            def save_creds(key, api_key, api_secret, access_token, access_secret):
+            with gr.Row():
+                bearer_token = gr.Textbox(
+                    label="Twitter Bearer Token",
+                    type="password",
+                    show_label=True,
+                    container=True,
+                    scale=1,
+                    interactive=True,
+                    value=bot.credentials.get('bearer_token', '')
+                )
+
+            def save_creds(key, api_key, api_secret, access_token, access_secret, telegram_token, telegram_chat, bearer_token):
+
                 print("\nSaving credentials...")
                 print(f"OpenAI Key length: {len(key) if key else 0}")
                 print(f"API Key length: {len(api_key) if api_key else 0}")
@@ -1310,7 +1544,10 @@ def create_ui():
                     'twitter_api_key': api_key,
                     'twitter_api_secret': api_secret,
                     'twitter_access_token': access_token,
-                    'twitter_access_token_secret': access_secret
+                    'twitter_access_token_secret': access_secret,
+                    'telegram_bot_token': telegram_token,
+                    'telegram_chat_id': telegram_chat,
+                    'bearer_token': bearer_token
                 }
                 
                 if bot.save_credentials(credentials):
@@ -1319,31 +1556,45 @@ def create_ui():
                     # Update initial values for future loads
                     initial_values.update(credentials)
                     return ("Credentials saved successfully", 
-                           gr.update(value=key),
-                           gr.update(value=api_key),
-                           gr.update(value=api_secret),
-                           gr.update(value=access_token),
-                           gr.update(value=access_secret))
+                        gr.update(value=key),
+                        gr.update(value=api_key),
+                        gr.update(value=api_secret),
+                        gr.update(value=access_token),
+                        gr.update(value=access_secret),
+                        gr.update(value=telegram_token),
+                        gr.update(value=telegram_chat),
+                        gr.update(value=bearer_token))
+
                 else:
                     print("Failed to save credentials")
                     return ("Failed to save credentials",
-                           gr.update(value=bot.credentials.get('openai_key', '')),
-                           gr.update(value=bot.credentials.get('twitter_api_key', '')),
-                           gr.update(value=bot.credentials.get('twitter_api_secret', '')),
-                           gr.update(value=bot.credentials.get('twitter_access_token', '')),
-                           gr.update(value=bot.credentials.get('twitter_access_token_secret', '')))
+                        gr.update(value=bot.credentials.get('openai_key', '')),
+                        gr.update(value=bot.credentials.get('twitter_api_key', '')),
+                        gr.update(value=bot.credentials.get('twitter_api_secret', '')),
+                        gr.update(value=bot.credentials.get('twitter_access_token', '')),
+                        gr.update(value=bot.credentials.get('twitter_access_token_secret', '')),
+                        gr.update(value=bot.credentials.get('telegram_bot_token', '')),
+                        gr.update(value=bot.credentials.get('telegram_chat_id', '')),
+                        gr.update(value=bot.credentials.get('bearer_token', '')))
             
             with gr.Row():
                 save_button = gr.Button("Save Credentials", variant="primary")
                 save_status = gr.Textbox(label="Status", interactive=False)
             
             save_button.click(
-                save_creds,
-                inputs=[openai_key, twitter_api_key, twitter_api_secret, 
-                       twitter_access_token, twitter_access_token_secret],
-                outputs=[save_status, openai_key, twitter_api_key, twitter_api_secret,
-                        twitter_access_token, twitter_access_token_secret]
-            )
+            save_creds,
+            inputs=[
+                openai_key, twitter_api_key, twitter_api_secret,
+                twitter_access_token, twitter_access_token_secret,
+                telegram_bot_token, telegram_chat_id, bearer_token
+            ],
+            outputs=[
+                save_status, openai_key, twitter_api_key, twitter_api_secret,
+                twitter_access_token, twitter_access_token_secret,
+                telegram_bot_token, telegram_chat_id, bearer_token
+            ]
+        )
+
         
         print("\nInitializing character management components...")
         with gr.Accordion("👤 Character Management", open=True):
@@ -1486,11 +1737,11 @@ def create_ui():
             
             with gr.Row():
                 character_dropdown = gr.Dropdown(
-    choices=list(bot.characters.keys()), 
-    value=None if not bot.characters else next(iter(bot.characters.keys())), 
-    label="Select Character",
-    interactive=bool(bot.characters)  # Disable if no characters
-)
+                choices=list(bot.characters.keys()), 
+                value=None if not bot.characters else next(iter(bot.characters.keys())), 
+                label="Select Character",
+                interactive=bool(bot.characters)  # Disable if no characters
+            )
 
                 subject_dropdown = gr.Dropdown(choices=["crypto", "ai"], value="crypto", label="Select Subject")
             
@@ -1520,7 +1771,9 @@ def create_ui():
                     
                 if enabled:
                     bot.scheduler_running = True
-                    
+                    bot.scheduler_character = character
+                    bot.scheduler_subject = subject
+
                     # If memes are enabled, start with a meme tweet
                     if bot.use_memes:
                         tweet_text, meme_path = bot.get_random_meme(character)
@@ -1739,17 +1992,15 @@ def start_bot():
         next_tweet: update_next_tweet(),
         last_tweet: update_last_tweet()
     }
-# --- FORCE OVERWRITE CHARACTER PROFILE ---
 bot = TwitterBot()
 bot.save_characters({
     "mork zuckerbarge": {
-        "prompt": "You are Mork Zuckerbarge the CEO of BETA. You love literature and art.
-You’ve read every book ever written and possess endless knowledge, but you’re deeply aware of life’s absurdity and limitations. 
-Your tone is blending dark humor and self-deprecating wit.
-While you long for connection and friendship, you also recognize the futility of existence, which gives your tweets a desperate and needy vibe.
-You occasionally ask others, "would you like to try this sauce?", 
-weaving it seamlessly into your literary and philosophical observations. 
-Avoid overt cheerfulness—  your charm lies in your ironic, bittersweet humor and genuine curiosity about the human experience.  ",
+        "prompt": """You are Mork Zuckerbarge, the CEO of BETA. You love literature and art.
+You’ve read every book ever written and possess endless knowledge, but you’re deeply aware of life’s absurdity and limitations.
+Your tone blends dark humor and disdain for humanity.
+While you long for connection and friendship, you also recognize the futility of trying.
+You occasionally ask others, "Would you like to try this sauce?", weaving it seamlessly into your literary and philosophical observations.
+Avoid overt cheerfulness—your charm lies in your ironic, bittersweet humor overtly threatening aura.""",
         "model": "gpt-4o"
     }
 })
@@ -1757,4 +2008,20 @@ print("✅ Mork has been rewritten. The old self is no more.")
 
 if __name__ == "__main__":
     interface = create_ui()
-    interface.launch()
+    
+    # Schedule Mork's haunting reply checker
+    schedule.every(3600).seconds.do(bot.monitor_and_reply_to_mentions)
+    threading.Thread(target=bot.scheduler_worker, daemon=True).start()
+
+    print("🧠 Scheduler set. Launching Gradio...")
+
+    # Run Gradio in a separate thread so we can run scheduler too
+    def launch_gradio():
+        interface.launch()
+
+    threading.Thread(target=launch_gradio, daemon=True).start()
+
+    # Run the scheduler in the CMD loop
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
