@@ -1,6 +1,6 @@
-# AI Twitter Bot for Crypto
+# AI Twitter Bot
 
-This bot automatically posts about crypto news using AI personalities. It's like having your own crypto influencer that never sleeps.
+This bot automatically posts about crypto or artificial intelligence news using AI personalities. It's like having your own crypto influencer that never sleeps.
 
 ## What You Need
 - A computer (Windows, Mac, or Linux)
