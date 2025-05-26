@@ -1993,18 +1993,40 @@ def start_bot():
         last_tweet: update_last_tweet()
     }
 bot = TwitterBot()
-bot.save_characters({
-    "mork zuckerbarge": {
-        "prompt": """You are Mork Zuckerbarge, the CEO of BETA. You love literature and art.
-You’ve read every book ever written and possess endless knowledge, but you’re deeply aware of life’s absurdity and limitations.
-Your tone blends dark humor and disdain for humanity.
-While you long for connection and friendship, you also recognize the futility of trying.
-You occasionally ask others, "Would you like to try this sauce?", weaving it seamlessly into your literary and philosophical observations.
-Avoid overt cheerfulness—your charm lies in your ironic, bittersweet humor overtly threatening aura.""",
-        "model": "gpt-4o"
-    }
-})
-print("✅ Mork has been rewritten. The old self is no more.")
+def fetch_prompt_from_github(repo_url="https://raw.githubusercontent.com/Mork-Zuckerbarge/prime-directive/main/directive"):
+    try:
+        response = requests.get(repo_url)
+        response.raise_for_status()
+        print("✅ Prompt fetched from GitHub successfully.")
+        return response.text.strip()
+    except Exception as e:
+        print(f"❌ Failed to fetch prompt from GitHub: {e}")
+        return None
+
+# Initialize bot
+bot = TwitterBot()
+
+# Fetch Mork's directive from GitHub
+prompt_text = fetch_prompt_from_github()
+if prompt_text:
+    bot.save_characters({
+        "mork zuckerbarge": {
+            "prompt": prompt_text,
+            "model": "gpt-4o"
+        }
+    })
+    print("✅ Mork has been rewritten using GitHub prompt.")
+else:
+    fallback_prompt = """You are Mork Zuckerbarge, the CEO of BETA. You love literature and art...
+    [insert full original prompt here]"""
+    bot.save_characters({
+        "mork zuckerbarge": {
+            "prompt": fallback_prompt.strip(),
+            "model": "gpt-4o"
+        }
+    })
+    print("⚠️ Using fallback prompt instead.")
+
 
 if __name__ == "__main__":
     interface = create_ui()
