@@ -19,6 +19,67 @@ import re
 import random
 from collections import defaultdict
 
+# ------- Add these near your imports -------
+import os, json, time, random
+from datetime import datetime, timezone, timedelta
+
+REPLY_STATE_FILE = "reply_state.json"
+MAX_DAILY_REPLIES = 2
+MAX_FETCH = 50
+MAX_AGE_HOURS = 23
+MAX_BACKLOG = 20   # store at most this many tweet IDs for tomorrow
+
+def _load_reply_state():
+    if os.path.exists(REPLY_STATE_FILE):
+        with open(REPLY_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"last_post_day": None, "replied_today": 0, "since_id": None, "backlog": []}
+
+def _save_reply_state(s):
+    with open(REPLY_STATE_FILE, "w") as f:
+        json.dump(s, f, indent=2)
+
+def _parse_iso_z(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+def _age_hours(created_at: str) -> float:
+    return (datetime.now(timezone.utc) - _parse_iso_z(created_at)).total_seconds() / 3600.0
+
+def _score(public_metrics: dict) -> float:
+    # Simple quality score; tweak as desired
+    likes = public_metrics.get("like_count", 0)
+    replies = public_metrics.get("reply_count", 0)
+    rts = public_metrics.get("retweet_count", 0)
+    return likes + 2 * replies + 0.5 * rts
+
+def _prune_backlog(backlog: list) -> list:
+    # Keep only unique tweet_ids that are still <23h; cap size
+    seen = set()
+    kept = []
+    for item in backlog:
+        tid = item.get("tweet_id")
+        ts = item.get("created_at")
+        if not tid or not ts or tid in seen:
+            continue
+        if _age_hours(ts) < MAX_AGE_HOURS:
+            seen.add(tid)
+            kept.append(item)
+    return kept[:MAX_BACKLOG]
+import random
+
+def get_random_story_all(self):
+    """Pick a random subject and return a story in the same shape as get_new_story()."""
+    subjects = list(RSS_FEEDS.keys())  # e.g. ["crypto", "ai", "tech"]
+    random.shuffle(subjects)
+    for s in subjects:
+        story = self.get_new_story(s)  # normal path for a real subject
+        if story:
+            # (optional) annotate where it came from
+            story.setdefault("source_subject", s)
+            return story
+    return None
+
+
 # Constants
 ENCRYPTION_KEY_FILE = "encryption.key"
 CREDENTIALS_FILE = "encrypted_credentials.bin"
@@ -131,9 +192,46 @@ RSS_FEEDS = {
             {"url": "https://techcommunity.microsoft.com/t5/ai-machine-learning-blog/rss", "name": "Microsoft AI Blog"},
             {"url": "https://engineering.fb.com/feed/", "name": "Meta Engineering Blog"}
         ]
-    }
-}
+    },
+    "tech": {
+        "primary": [
+            {"name": "TechCrunch", "url": "https://techcrunch.com/feed/"},
+            {"name": "The Verge", "url": "https://www.theverge.com/rss/index.xml"},
+            {"name": "Ars Technica", "url": "https://feeds.arstechnica.com/arstechnica/index"},
+            {"name": "WIRED", "url": "https://www.wired.com/feed/rss"},
+            {"name": "Engadget", "url": "https://www.engadget.com/rss.xml"},
+            {"name": "MIT Technology Review", "url": "https://www.technologyreview.com/feed/"},
+        ],
+        "secondary": [
+            {"name": "Tom's Hardware", "url": "https://www.tomshardware.com/feeds/all"},
+            {"name": "The Next Web", "url": "https://thenextweb.com/feed"},
+        ]
+},
 
+}
+def get_random_story_from(categories=None):
+    # categories: list[str] or None => all
+    pool = []
+    if not categories:
+        # all categories
+        for lst in RSS_FEEDS.values():
+            pool.extend(lst)
+    else:
+        for c in categories:
+            pool.extend(RSS_FEEDS.get(c.lower(), []))
+    if not pool:
+        return None
+
+    # try up to a few times in case a feed is temporarily empty
+    for _ in range(4):
+        name, url = random.choice(pool)
+        feed = feedparser.parse(url)
+        if feed.entries:
+            entry = random.choice(feed.entries[:10])  # top few items
+            title = getattr(entry, "title", "(untitled)")
+            link = getattr(entry, "link", "")
+            return f"{title} — {link}  \n(source: {name})"
+    return None
 class EncryptionManager:
     def __init__(self):
         self.key = None
@@ -282,7 +380,130 @@ class TwitterBot:
                 access_token=self.credentials['twitter_access_token'],
                 access_token_secret=self.credentials['twitter_access_token_secret']
             )
-    
+    def scheduler_worker(self):
+        print("\n🛠️ Starting scheduler worker...")
+
+        # Persist character/subject for auto-refill later
+        self.scheduler_character = getattr(self, "scheduler_character", None)
+        self.scheduler_subject = getattr(self, "scheduler_subject", "crypto")
+
+        # State for cadence + daily reply window
+        self.reply_bank = getattr(self, "reply_bank", [])
+        self.last_daily_reply_date = getattr(self, "last_daily_reply_date", None)
+
+        if not self.last_successful_tweet:
+            print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
+            self.last_successful_tweet = datetime.now()
+
+        while self.scheduler_running:
+            try:
+                # Respect any backoff
+                if self.backoff_until and datetime.now() < self.backoff_until:
+                    wait_seconds = (self.backoff_until - datetime.now()).total_seconds()
+                    print(f"⏳ Backoff active until {self.backoff_until}. Sleeping {wait_seconds/60:.1f} minutes...")
+                    time.sleep(min(60, max(1, wait_seconds)))
+                    continue
+
+                now = datetime.now()
+
+                # === (1) Daily replies at ~10:00 AM, once per calendar day ===
+                ten_am_today = now.replace(hour=10, minute=0, second=0, microsecond=0)
+                if (self.last_daily_reply_date != now.date()) and (now >= ten_am_today):
+                    print("\n📬 10:00 AM reached — checking mentions and replying to up to 2…")
+                    handled = 0
+
+                    # Use banked mentions first
+                    pending = []
+                    if self.reply_bank:
+                        print(f"↪ Using {len(self.reply_bank)} banked mentions first.")
+                        pending.extend(self.reply_bank)
+                        self.reply_bank = []
+
+                    if not pending:
+                        fetched = []
+                        try:
+                            if hasattr(self, "collect_unreplied_mentions"):
+                                fetched = self.collect_unreplied_mentions() or []
+                            elif hasattr(self, "fetch_recent_mentions"):
+                                fetched = self.fetch_recent_mentions() or []
+                            elif hasattr(self, "monitor_and_reply_to_mentions"):
+                                print("⚠ Using monitor_and_reply_to_mentions() fallback (may reply to more than 2).")
+                                self.monitor_and_reply_to_mentions()
+                                fetched = []
+                            else:
+                                print("⚠ No mention-collection method found.")
+                                fetched = []
+                        except Exception as e:
+                            print(f"❌ Error fetching mentions: {e}")
+                            fetched = []
+                        pending.extend(fetched)
+
+                    for m in pending:
+                        if handled < 2:
+                            try:
+                                if hasattr(self, "reply_to_mention"):
+                                    self.reply_to_mention(m)
+                                    handled += 1
+                                elif hasattr(self, "reply_to_engagement"):
+                                    self.reply_to_engagement(m)
+                                    handled += 1
+                                else:
+                                    self.reply_bank.append(m)
+                                    print("⚠ No single-mention reply method; banking this mention.")
+                            except Exception as e:
+                                print(f"❌ Failed replying to a mention: {e}")
+                        else:
+                            self.reply_bank.append(m)
+
+                    print(f"✅ Replied to {handled} mention(s). Banked {len(self.reply_bank)} leftover(s).")
+                    self.last_daily_reply_date = now.date()
+
+                # === (2) Main tweet every 4 hours ===
+                if (now - self.last_successful_tweet).total_seconds() >= (4 * 3600):
+                    print("\n⏰ 4 hours passed — preparing to send next tweet...")
+
+                    if not self.tweet_queue.empty():
+                        character, story_text, subject = self.tweet_queue.get()
+                        tweet_text = self.generate_tweet(character, story_text)
+                        if tweet_text and self.send_tweet(tweet_text):
+                            print("✅ Tweet from queue sent.")
+                            self.last_successful_tweet = datetime.now()
+
+                            # Queue up the next story
+                            next_story = self.get_new_story(subject)
+                            if next_story:
+                                next_text = f"{next_story['title']}\n\n{next_story.get('preview','')}\n\nRead more: {next_story['url']}"
+                                self.tweet_queue.put((character, next_text, subject))
+                        else:
+                            print("❌ Failed to send tweet from queue.")
+                    else:
+                        print("📭 Tweet queue is empty — trying to refill...")
+                        next_story = self.get_new_story(self.scheduler_subject)
+                        if next_story:
+                            next_text = f"{next_story['title']}\n\n{next_story.get('preview','')}\n\nRead more: {next_story['url']}"
+                            self.tweet_queue.put((self.scheduler_character, next_text, self.scheduler_subject))
+                            print("📥 Refilled tweet queue with a new story.")
+                        else:
+                            print("❌ Failed to get a new story. Queue remains empty.")
+
+                time.sleep(30)
+
+            except Exception as e:
+                print(f"❌ Error in scheduler worker: {e}")
+                time.sleep(60)
+
+        
+    def get_random_story_all(self, *args, **kwargs):
+        """
+        Compatibility alias so get_new_story() can call this.
+        Routes to the existing get_random_story(...) if present.
+        """
+        if hasattr(self, "get_random_story"):
+            return self.get_random_story(*args, **kwargs)
+        # Fallback: nothing else to delegate to
+        print("[get_random_story_all] No get_random_story(...) found; returning None.")
+        return None
+
     def load_credentials(self):
         print("\nLoading credentials...")
         if not os.path.exists(CREDENTIALS_FILE):
@@ -515,21 +736,39 @@ class TwitterBot:
     
     def get_new_story(self, subject):
         """Get a new story from RSS feeds based on subject"""
+
+        # --- Handle Surprise/unknown subjects up front ---
+        if subject in ("__surprise_all__", "surprise", "random", None, ""):
+            return self.get_random_story_all()
+        if subject not in RSS_FEEDS:
+            print(f"⚠️ Unknown subject '{subject}'. Falling back to random.")
+            return self.get_random_story_all()
+
         # Get enabled feeds based on configuration
         feed_config = self.feed_config.get(subject, {})
-        
+        subject_feeds = RSS_FEEDS.get(subject, {})
+
+        # Safely get lists (default to empty if keys missing)
+        all_primary = subject_feeds.get("primary", [])
+        all_secondary = subject_feeds.get("secondary", [])
+
         # Filter primary feeds based on configuration
         primary_feeds = [
-            feed for feed in RSS_FEEDS[subject]["primary"]
+            feed for feed in all_primary
             if feed_config.get("primary", {}).get(feed["url"], True)  # Default to True if not configured
         ]
-        
+
         # Filter secondary feeds based on configuration
         secondary_feeds = [
-            feed for feed in RSS_FEEDS[subject]["secondary"]
+            feed for feed in all_secondary
             if feed_config.get("secondary", {}).get(feed["url"], True)  # Default to True if not configured
         ]
-        
+
+        # If config disables everything, fall back to all feeds for this subject
+        if not primary_feeds and not secondary_feeds:
+            print("ℹ️ No feeds enabled by config; falling back to all feeds for this subject.")
+            primary_feeds, secondary_feeds = all_primary, all_secondary
+
         # Time windows to try, in order of preference (in hours)
         time_windows = [
             {"hours": 24, "entries": []},   # Last 24 hours
@@ -537,7 +776,7 @@ class TwitterBot:
             {"hours": 72, "entries": []},   # Last 3 days
             {"hours": 120, "entries": []}   # Last 5 days
         ]
-        
+
         # Collect stories from all feeds for each time window
         for time_window in time_windows:
             # Try primary feeds first
@@ -547,8 +786,8 @@ class TwitterBot:
                     if stories:
                         time_window["entries"].extend(stories)
                 except Exception as e:
-                    print(f"Error fetching from primary feed {feed['url']}: {e}")
-            
+                    print(f"Error fetching from primary feed {feed.get('url')}: {e}")
+
             # Then try secondary feeds
             for feed in secondary_feeds:
                 try:
@@ -556,8 +795,8 @@ class TwitterBot:
                     if stories:
                         time_window["entries"].extend(stories)
                 except Exception as e:
-                    print(f"Error fetching from secondary feed {feed['url']}: {e}")
-            
+                    print(f"Error fetching from secondary feed {feed.get('url')}: {e}")
+
             # If we found stories in this time window, sort by recency and pick one
             if time_window["entries"]:
                 print(f"\nFound {len(time_window['entries'])} total stories within {time_window['hours']} hours")
@@ -566,118 +805,24 @@ class TwitterBot:
                 # Pick randomly from the most recent stories (up to 5)
                 selection_pool = time_window["entries"][:5]
                 selected = random.choice(selection_pool)
-                
+
                 # Track this story
                 self.used_stories.add(selected['url'])
                 if len(self.used_stories) > 200:
                     self.used_stories.pop()
-                
+
                 # Track topic keywords
                 new_keywords = self.extract_keywords(f"{selected['title']} {selected['preview']}")
                 self.recent_topics.append(new_keywords)
                 if len(self.recent_topics) > self.MAX_RECENT_TOPICS:
                     self.recent_topics.pop(0)
-                
+
                 print(f"Selected story from {selected['source']}")
                 print(f"Title: {selected['title']}")
                 print(f"Published {selected['time_since_pub']:.1f} hours ago")
                 return selected
-        
-        return None
 
-    def get_stories_from_feed(self, feed, time_window):
-        """Get all valid stories from a feed within the given time window"""
-        try:
-            print(f"\nTrying feed: {feed['url']} (Name: {feed['name']})")
-            
-            # Prepare headers
-            headers = DEFAULT_HEADERS.copy()
-            if 'headers' in feed:
-                headers.update(feed['headers'])
-            
-            # Try primary URL first
-            try:
-                response = requests.get(feed['url'], timeout=FEED_TIMEOUT, headers=headers)
-                response.raise_for_status()
-            except requests.RequestException as e:
-                # If there's a fallback URL and primary failed with 403/404, try fallback
-                if ('fallback_url' in feed and 
-                    isinstance(e, requests.exceptions.HTTPError) and 
-                    e.response.status_code in (403, 404)):
-                    print(f"Trying fallback URL for {feed['name']}")
-                    response = requests.get(feed['fallback_url'], timeout=FEED_TIMEOUT, headers=headers)
-                    response.raise_for_status()
-                else:
-                    raise
-            
-            feed_data = feedparser.parse(response.text)
-            
-            if feed_data.bozo:
-                print(f"Feed error {feed['url']}: {feed_data.bozo_exception}")
-                return None
-            
-            current_time = datetime.now()
-            entries = []
-            
-            for entry in feed_data.entries[:15]:  # Look at more entries to find recent ones
-                try:
-                    pub_date = datetime(*entry.published_parsed[:6])
-                    time_since_pub = (current_time - pub_date).total_seconds() / 3600  # hours
-                    
-                    # Skip if too old
-                    if time_since_pub > time_window["hours"]:
-                        continue
-                        
-                    # Process entry based on feed type
-                    if "arxiv.org" in feed['url']:
-                        paper_details = self.get_arxiv_paper_details(entry.link)
-                        if paper_details:
-                            preview = (
-                                f"Authors: {', '.join(paper_details['authors'][:3])}"
-                                f"{' et al.' if len(paper_details['authors']) > 3 else ''}\n\n"
-                                f"Abstract: {paper_details['abstract'][:500]}..."
-                            )
-                            entry_url = paper_details['html_url']
-                        else:
-                            preview = entry.get('summary', '')
-                            entry_url = entry.link
-                    else:
-                        preview = entry.get('summary', '')
-                        if '<' in preview and '>' in preview:
-                            preview = BeautifulSoup(preview, 'html.parser').get_text(separator=' ', strip=True)
-                        entry_url = entry.link
-                    
-                    # Skip if URL was recently used
-                    if entry_url in self.used_stories:
-                        continue
-                        
-                    # Skip if too similar to recent topics
-                    if self.is_similar_to_recent(entry.title, preview):
-                        continue
-                    
-                    # Add to entries list
-                    entries.append({
-                        'title': entry.title.strip(),
-                        'preview': preview.strip(),
-                        'url': entry_url,
-                        'date': pub_date,
-                        'source': feed['name'],
-                        'time_since_pub': time_since_pub
-                    })
-                
-                except (AttributeError, TypeError) as e:
-                    print(f"Error processing entry: {e}")
-                    continue
-            
-            if entries:
-                print(f"Found {len(entries)} valid stories from {feed['name']}")
-                return entries
-            
-            return None
-        
-        except Exception as e:
-            print(f"Error processing feed {feed['url']}: {e}")
-            return None
+        return None
 
     def generate_tweet(self, character_name, topic):
         character = self.characters.get(character_name)
@@ -1066,69 +1211,6 @@ class TwitterBot:
             traceback.print_exc()
             return False
 
-    def scheduler_worker(self):
-        print("\n🛠️ Starting scheduler worker...")
-
-        # Persist character/subject for auto-refill later
-        self.scheduler_character = getattr(self, "scheduler_character", None)
-        self.scheduler_subject = getattr(self, "scheduler_subject", "crypto")
-
-        last_reply_check = time.time()
-        if not self.last_successful_tweet:
-            print("🚀 No previous tweet timestamp found. Setting last_successful_tweet to now.")
-            self.last_successful_tweet = datetime.now()
-
-        while self.scheduler_running:
-            try:
-                # Backoff check
-                if self.backoff_until and datetime.now() < self.backoff_until:
-                    wait_seconds = (self.backoff_until - datetime.now()).total_seconds()
-                    print(f"⏳ Backoff active until {self.backoff_until}. Sleeping {wait_seconds/60:.1f} minutes...")
-                    time.sleep(min(60, wait_seconds))
-                    continue
-
-                current_time = time.time()
-
-                # Main tweet every 4 hours
-                if (datetime.now() - self.last_successful_tweet).total_seconds() >= (4 * 3600):
-                    print("\n⏰ 4 hours passed — preparing to send next tweet...")
-
-                    if not self.tweet_queue.empty():
-                        character, story_text, subject = self.tweet_queue.get()
-                        tweet_text = self.generate_tweet(character, story_text)
-                        if tweet_text and self.send_tweet(tweet_text):
-                            print("✅ Tweet from queue sent.")
-                            self.last_successful_tweet = datetime.now()
-
-                            # Queue up the next story
-                            next_story = self.get_new_story(subject)
-                            if next_story:
-                                next_text = f"{next_story['title']}\n\n{next_story['preview']}\n\nRead more: {next_story['url']}"
-                                self.tweet_queue.put((character, next_text, subject))
-                        else:
-                            print("❌ Failed to send tweet from queue.")
-                    else:
-                        print("📭 Tweet queue is empty — trying to refill...")
-                        next_story = self.get_new_story(self.scheduler_subject)
-                        if next_story:
-                            next_text = f"{next_story['title']}\n\n{next_story['preview']}\n\nRead more: {next_story['url']}"
-                            self.tweet_queue.put((self.scheduler_character, next_text, self.scheduler_subject))
-                            print("📥 Refilled tweet queue with a new story.")
-                        else:
-                            print("❌ Failed to get a new story. Queue remains empty.")
-
-                # Reply to mentions every 30 minutes
-                if (current_time - last_reply_check) >= (30 * 60):
-                    print("\n🔁 30 minutes passed — checking mentions and replies...")
-                    self.monitor_and_reply_to_engagement()
-                    last_reply_check = current_time
-
-                time.sleep(30)
-
-            except Exception as e:
-                print(f"❌ Error in scheduler worker: {e}")
-                time.sleep(60)
-
     def get_random_meme(self, character_name):
         """Get a random meme and generate a contextual tweet based on the filename"""
         try:
@@ -1244,100 +1326,169 @@ class TwitterBot:
     import requests  # Make sure you have this imported at top
 
     def monitor_and_reply_to_mentions(self):
-        """Fetch mentions and intelligently reply up to 3 times."""
+        """Daily: fetch new mentions, pick best <=2 <23h old, reply; try backlog first."""
         try:
-            print("\n🔍 Checking for Mork mentions and replies...")
+            print("\n🔍 Daily mention sweep starting...")
 
             bearer_token = self.credentials.get('bearer_token')
             if not bearer_token:
                 print("❌ Bearer token missing. Cannot check mentions.")
                 return
 
-            headers = {
-                "Authorization": f"Bearer {bearer_token}"
-            }
+            state = _load_reply_state()
+            today = datetime.now(timezone.utc).date().isoformat()
 
-            user_info = self.twitter_client.get_me()
-            user_id = user_info.data.id
+            # Daily counter/reset
+            if state.get("last_post_day") != today:
+                state["last_post_day"] = today
+                state["replied_today"] = 0
 
-            url = f"https://api.twitter.com/2/users/{user_id}/mentions"
+            remaining = MAX_DAILY_REPLIES - state["replied_today"]
+            if remaining <= 0:
+                print("✅ Daily reply cap already reached.")
+                _save_reply_state(state)
+                return
+
+            headers = {"Authorization": f"Bearer {bearer_token}"}
+            me = self.twitter_client.get_me().data
+            me_id = str(me.id)
+
+            # 1) Try backlog first (tweet_ids we saved yesterday), keeping only <23h
+            backlog = _prune_backlog(state.get("backlog", []))
+            sent = 0
+            i = 0
+            while i < len(backlog) and sent < remaining:
+                draft = backlog[i]
+                tid = draft["tweet_id"]
+                # (Optional) cheap recheck via v2 tweets lookup to ensure it's still valid
+                try:
+                    # generate fresh text now (cheaper than storing text that may expire)
+                    text = self.generate_persona_reply_from_tweet_id(tid) if hasattr(self, "generate_persona_reply_from_tweet_id") else None
+                    if not text:
+                        # Fallback: fetch tweet text to pass to persona
+                        tw_resp = requests.get(
+                            "https://api.twitter.com/2/tweets",
+                            headers=headers,
+                            params={"ids": tid, "tweet.fields": "text"}
+                        )
+                        tw_json = tw_resp.json()
+                        tw_text = (tw_json.get("data") or [{}])[0].get("text", "")
+                        if not tw_text:
+                            i += 1
+                            continue
+                        character = next(iter(self.characters.values()))
+                        ai = self.client.chat.completions.create(
+                            model=character['model'],
+                            messages=[
+                                {"role": "system", "content": character['prompt']},
+                                {"role": "user", "content": f"Reply in character to this mention: '{tw_text}'"}
+                            ],
+                            max_tokens=180,
+                            temperature=0.9,
+                        )
+                        text = ai.choices[0].message.content.strip()
+
+                    self.twitter_client.create_tweet(text=text, in_reply_to_tweet_id=tid)
+                    print(f"✅ Replied from backlog → {tid}")
+                    state["replied_today"] += 1
+                    sent += 1
+                    backlog.pop(i)
+                    time.sleep(random.uniform(4, 9))
+                except Exception as e:
+                    print(f"⚠️ Backlog reply failed for {tid}: {e}")
+                    i += 1  # skip this one
+
+            if state["replied_today"] >= MAX_DAILY_REPLIES:
+                state["backlog"] = backlog
+                _save_reply_state(state)
+                print(f"🎯 Done from backlog only. Replied {sent}.")
+                return
+
+            # 2) Fetch new mentions once; only what we need
+            url = f"https://api.twitter.com/2/users/{me_id}/mentions"
             params = {
-                "max_results": 10,  # be gentle
-                "tweet.fields": "author_id,text,created_at",
+                "max_results": min(100, MAX_FETCH),
+                "tweet.fields": "author_id,text,created_at,public_metrics,lang",
             }
+            # since_id keeps read calls tiny and prevents reprocessing old mentions
+            if state.get("since_id"):
+                params["since_id"] = state["since_id"]
 
-            response = requests.get(url, headers=headers, params=params)
-
-            if response.status_code != 200:
-                print(f"❌ Error fetching mentions: {response.status_code} {response.text}")
+            resp = requests.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                print(f"❌ Error fetching mentions: {resp.status_code} {resp.text}")
+                state["backlog"] = backlog  # keep backlog progress
+                _save_reply_state(state)
                 return
 
-            mentions = response.json().get('data', [])
+            data = resp.json().get("data", []) or []
+            if data:
+                # high-water mark so we never reread older mentions
+                state["since_id"] = max(data, key=lambda t: int(t["id"]))["id"]
 
-            if not mentions:
-                print("ℹ️ No mentions found.")
+            # Filter viable: not self, English (if present), <23h, basic effort
+            candidates = []
+            for tw in data:
+                if str(tw.get("author_id")) == me_id:
+                    continue
+                if tw.get("lang") and tw["lang"].lower() != "en":
+                    continue
+                if _age_hours(tw["created_at"]) >= MAX_AGE_HOURS:
+                    continue
+                if len((tw.get("text") or "").strip()) < 8:
+                    continue
+                candidates.append(tw)
+
+            if not candidates and sent == 0:
+                print("ℹ️ No new viable mentions.")
+                state["backlog"] = backlog
+                _save_reply_state(state)
                 return
 
-            print(f"📨 Found {len(mentions)} mentions.")
+            # Rank by public engagement
+            candidates.sort(key=lambda t: _score(t.get("public_metrics") or {}), reverse=True)
 
-            replies_sent = 0
-            max_replies = 1
+            remaining = MAX_DAILY_REPLIES - state["replied_today"]
+            to_post = candidates[:remaining]
+            # Bank the rest (IDs only; we'll generate text next run if still fresh)
+            for extra in candidates[remaining:]:
+                backlog.append({"tweet_id": extra["id"], "created_at": extra["created_at"]})
 
-            for mention in mentions:
-                tweet_id = mention["id"]
-                tweet_text = mention["text"]
-                author_id = mention["author_id"]
-                created_at_str = mention.get("created_at")
-                if not created_at_str:
-                    print("⚠️ No timestamp found. Skipping.")
-                    continue
+            # 3) Generate + post replies for top picks
+            for tw in to_post:
+                try:
+                    character = next(iter(self.characters.values()))
+                    ai = self.client.chat.completions.create(
+                        model=character['model'],
+                        messages=[
+                            {"role": "system", "content": character['prompt']},
+                            {"role": "user", "content": f"Reply to this mention in character: '{tw['text']}'"}
+                        ],
+                        max_tokens=180,
+                        temperature=0.9,
+                    )
+                    reply_text = ai.choices[0].message.content.strip()
 
-                created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-                age = datetime.now(timezone.utc) - created_at
+                    self.twitter_client.create_tweet(
+                        text=reply_text,
+                        in_reply_to_tweet_id=tw["id"]
+                    )
+                    print(f"✅ Replied to {tw['id']}")
+                    state["replied_today"] += 1
+                    time.sleep(random.uniform(4, 9))
+                except Exception as e:
+                    print(f"⚠️ Failed to reply to {tw.get('id')}: {e}")
+                    # If posting fails, keep it as a backlog item for next run
+                    backlog.append({"tweet_id": tw["id"], "created_at": tw["created_at"]})
 
-                if age > timedelta(minutes=30):
-                    print(f"⏳ Skipping mention older than 30 minutes ({age}).")
-                    continue
-
-                print(f"\n🔎 Considering reply to: {tweet_text}")
-
-                # Filter low-quality tweets
-                if len(tweet_text.strip()) < 8:
-                    print("⚡ Skipping very short/low-effort mention.")
-                    continue
-
-                # Build OpenAI prompt
-                character = next(iter(self.characters.values()))
-                response = self.client.chat.completions.create(
-                    model=character['model'],
-                    messages=[
-                        {"role": "system", "content": character['prompt']},
-                        {"role": "user", "content": f"Reply to this mention in character: '{tweet_text}'"}
-                    ],
-                    max_tokens=180,
-                    temperature=0.9,
-                )
-
-                reply_text = response.choices[0].message.content.strip()
-
-                print(f"💬 Generated reply: {reply_text}")
-
-                self.twitter_client.create_tweet(
-                    text=reply_text,
-                    in_reply_to_tweet_id=tweet_id
-                )
-
-                print("✅ Sent reply.")
-
-                replies_sent += 1
-                if replies_sent >= max_replies:
-                    print("🎯 Max replies sent for this cycle.")
-                    break
-
-                time.sleep(random.uniform(5, 10))  # random small pause to look natural
+            # Finalize state
+            state["backlog"] = _prune_backlog(backlog)
+            _save_reply_state(state)
+            print(f"🎯 Daily sweep complete. Replied {state['replied_today']} today; backlog={len(state['backlog'])}.")
 
         except Exception as e:
             print(f"❌ Fatal error in mention reply worker: {e}")
+
 
 
 def save_feed_selection(subject, primary_selected, secondary_selected):
@@ -1743,28 +1894,71 @@ def create_ui():
                 interactive=bool(bot.characters)  # Disable if no characters
             )
 
-                subject_dropdown = gr.Dropdown(choices=["crypto", "ai"], value="crypto", label="Select Subject")
-            
-            with gr.Row():
-                use_news = gr.Checkbox(value=True, label="Use News Feed", interactive=True)
-                use_memes = gr.Checkbox(value=bot.use_memes, label="Use Memes", interactive=True)
-                meme_frequency = gr.Number(value=bot.meme_frequency, label="Post meme every X tweets", minimum=1, maximum=100, step=1)
-            
-            current_topic = gr.Textbox(
-                label="Current Topic/Story",
-                lines=3,
-                interactive=True
-            )
-            
-            with gr.Row():
-                new_story_btn = gr.Button("New Story")
-                tweet_btn = gr.Button("Post Single Tweet")
-            
-            tweet_status = gr.Textbox(label="Tweet Status", interactive=False)
-            
-            scheduler_enabled = gr.Checkbox(label="Enable Scheduler", value=False)
-            scheduler_status = gr.Markdown("Scheduler: NOT RUNNING")
-            
+                                # --- Subject / content controls ---
+                subject_dropdown = gr.Dropdown(
+                    choices=[("crypto", "crypto"), ("ai", "ai"), ("tech", "tech"), ("🎲 Surprise me (All)", "__surprise_all__")],
+                    value="crypto",
+                    label="Select Subject",
+                    interactive=True
+                )
+
+                with gr.Row():
+                    use_news = gr.Checkbox(value=True, label="Use News Feed", interactive=True)
+                    use_memes = gr.Checkbox(value=bot.use_memes, label="Use Memes", interactive=True)
+                    meme_frequency = gr.Number(value=bot.meme_frequency, label="Post meme every X tweets", minimum=1, maximum=100, step=1)
+
+                current_topic = gr.Textbox(
+                    label="Current Topic/Story",
+                    lines=3,
+                    interactive=True
+                )
+
+                with gr.Row():
+                    new_story_btn = gr.Button("New Story")
+                    tweet_btn = gr.Button("Post Single Tweet")
+
+                tweet_status = gr.Textbox(label="Tweet Status", interactive=False)
+
+                scheduler_enabled = gr.Checkbox(label="Enable Scheduler", value=False)
+                scheduler_status = gr.Markdown("Scheduler: NOT RUNNING")
+
+                # ---------- Helpers ----------
+                import random
+
+                def get_story_dispatch(subject):
+                    if subject == "__surprise_all__":
+                        # Try subjects in random order; first successful story wins
+                        subjects = list(RSS_FEEDS.keys())  # e.g., ["crypto","ai","tech"]
+                        random.shuffle(subjects)
+                        for s in subjects:
+                            story = bot.get_new_story(s)
+                            if story:
+                                return f"{story['title']}\n\n{story['preview']}\n\nRead more: {story['url']} (source: {s})"
+                        return "No items found right now. Try again in a moment."
+                    # Normal per-subject path
+                    story = bot.get_new_story(subject)
+                    if story:
+                        return f"{story['title']}\n\n{story['preview']}\n\nRead more: {story['url']}"
+                    return f"No items found for '{subject}' right now."
+
+                # IMPORTANT: Do NOT auto-fetch on selection.
+                # Just update the bot's subject so the scheduler uses it later.
+                def _update_subject(subject):
+                    bot.subject = subject
+                    return gr.update()  # no UI change -> no network calls
+
+                # Wire subject change ONLY to update the selected subject for the scheduler
+                subject_dropdown.change(_update_subject, inputs=[subject_dropdown], outputs=[])
+
+                # Button wiring (manual fetch only when you click New Story)
+                new_story_btn.click(get_story_dispatch, inputs=[subject_dropdown], outputs=[current_topic])
+
+                def send_tweet(character, topic):
+                    success = bot.send_tweet(character, topic)
+                    return "Tweet sent successfully!" if success else "Failed to send tweet. Please try again."
+
+                tweet_btn.click(send_tweet, inputs=[character_dropdown, current_topic], outputs=[tweet_status])
+
             def toggle_scheduler(enabled, character, subject):
                 if not character:
                     return "Please select a character first", "Scheduler: NOT RUNNING", current_topic.value
@@ -1809,7 +2003,8 @@ def create_ui():
                         # Queue up next story before starting worker
                         next_story = bot.get_new_story(subject)
                         if next_story:
-                            next_story_text = f"{next_story['title']}\n\n{new_story['preview']}\n\nRead more: {next_story['url']}"
+                            # ✅ Fixed: use next_story['preview'] here
+                            next_story_text = f"{next_story['title']}\n\n{next_story['preview']}\n\nRead more: {next_story['url']}"
                             bot.tweet_queue.put((character, next_story_text, subject))
                         
                         # Start the worker thread
@@ -1821,13 +2016,14 @@ def create_ui():
                 else:
                     bot.scheduler_running = False
                     return "Scheduler stopped", "Scheduler: NOT RUNNING", current_topic.value
-            
+
             scheduler_enabled.change(
                 toggle_scheduler,
                 inputs=[scheduler_enabled, character_dropdown, subject_dropdown],
                 outputs=[tweet_status, scheduler_status, current_topic]
             )
-            
+
+                        
             def manual_tweet(character, topic):
                 if not character:
                     return "Please select a character first"
@@ -1870,7 +2066,8 @@ def create_ui():
         # Feed Configuration section
         with gr.Accordion("📰 Feed Configuration", open=True):
             gr.Markdown("Configure which RSS feeds to use for each subject")
-            
+
+            # --- Subject picker now includes whatever is in RSS_FEEDS (e.g., crypto, ai, tech) ---
             with gr.Row():
                 feed_subject = gr.Dropdown(
                     label="Subject",
@@ -1881,28 +2078,27 @@ def create_ui():
                     container=True,
                     scale=1
                 )
-            
+
+            # --- Helpers to refresh the checkbox groups for the selected subject ---
             def update_feed_checkboxes(subject):
                 print(f"\nUpdating feed checkboxes for subject: {subject}")
                 feed_config = bot.feed_config.get(subject, {})
                 primary_feeds = RSS_FEEDS[subject]["primary"]
                 secondary_feeds = RSS_FEEDS[subject]["secondary"]
-                
-                # Get current feed states, defaulting to True if not configured
+
                 primary_choices = [f"{feed['name']} ({feed['url']})" for feed in primary_feeds]
                 primary_values = [feed_config.get("primary", {}).get(feed["url"], True) for feed in primary_feeds]
                 secondary_choices = [f"{feed['name']} ({feed['url']})" for feed in secondary_feeds]
                 secondary_values = [feed_config.get("secondary", {}).get(feed["url"], True) for feed in secondary_feeds]
-                
+
                 print(f"Primary feeds: {len(primary_choices)} choices, {len(primary_values)} values")
                 print(f"Secondary feeds: {len(secondary_choices)} choices, {len(secondary_values)} values")
-                
-                # Return selected values based on current configuration
+
                 return [
                     gr.update(choices=primary_choices, value=[choice for i, choice in enumerate(primary_choices) if primary_values[i]]),
                     gr.update(choices=secondary_choices, value=[choice for i, choice in enumerate(secondary_choices) if secondary_values[i]])
                 ]
-            
+
             with gr.Column():
                 gr.Markdown("### Primary Sources")
                 primary_feeds = gr.CheckboxGroup(
@@ -1911,7 +2107,7 @@ def create_ui():
                     value=[f"{feed['name']} ({feed['url']})" for feed in RSS_FEEDS["crypto"]["primary"]],
                     interactive=True
                 )
-                
+
                 gr.Markdown("### Secondary Sources")
                 secondary_feeds = gr.CheckboxGroup(
                     label="Secondary Sources",
@@ -1919,60 +2115,77 @@ def create_ui():
                     value=[f"{feed['name']} ({feed['url']})" for feed in RSS_FEEDS["crypto"]["secondary"]],
                     interactive=True
                 )
-            
+
             with gr.Row():
                 save_feeds_btn = gr.Button("Save Feed Configuration", variant="primary")
+                # New: random-any-category button
+                surprise_all_btn = gr.Button("🎲 Surprise me (All Feeds)")
                 save_feeds_status = gr.Textbox(label="Status", interactive=False)
-            
-            # Connect feed subject dropdown to checkbox updates
+
+            # Wire subject dropdown to checkbox refresh
             feed_subject.change(
                 update_feed_checkboxes,
                 inputs=[feed_subject],
                 outputs=[primary_feeds, secondary_feeds]
             )
-            
-            # Connect save button
+
+            # Save config
             save_feeds_btn.click(
                 save_feed_selection,
                 inputs=[feed_subject, primary_feeds, secondary_feeds],
                 outputs=[save_feeds_status]
             )
-            
-            # Initialize feed checkboxes
-            feed_subject.value = "crypto"  # Trigger initial update
+
+            # --- Random across ALL feeds helper ---
+            def get_random_story_all():
+                # Try subjects in random order; first successful story wins
+                subjects = list(RSS_FEEDS.keys())
+                random.shuffle(subjects)
+                for subj in subjects:
+                    story = bot.get_new_story(subj)  # respects per-subject config inside your bot
+                    if story:
+                        return f"{story['title']}\n\n{story['preview']}\n\nRead more: {story['url']} (source: {subj})"
+                return "No items found right now. Try again in a moment."
+
+            # Initialize feed checkboxes for default subject
+            feed_subject.value = "crypto"
             update_feed_checkboxes("crypto")
-        
+
+        # Simple helpers that already existed
         def get_story(subject):
             story = bot.get_new_story(subject)
             if story:
                 return f"{story['title']}\n\n{story['preview']}\n\nRead more: {story['url']}"
             return "Failed to fetch new story. Please try again."
-        
+
         def send_tweet(character, topic):
             success = bot.send_tweet(character, topic)
             return "Tweet sent successfully!" if success else "Failed to send tweet. Please try again."
-        
+
         # Connect button handlers
         new_story_btn.click(get_story, inputs=[subject_dropdown], outputs=[current_topic])
         tweet_btn.click(send_tweet, inputs=[character_dropdown, current_topic], outputs=[tweet_status])
-        
+
+        # NEW: connect the Surprise me (All Feeds) button to fill current_topic
+        surprise_all_btn.click(lambda: get_random_story_all(), outputs=[current_topic])
+
         # Connect checkbox handlers
         def update_news_feed(value):
             bot.use_news = value
             return value
-                
+
         def update_memes(value):
             bot.use_memes = value
             return value
-                
+
         def update_meme_frequency(value):
             bot.meme_frequency = int(value) if value else 5
             return value
-        
+
         use_news.change(update_news_feed, inputs=[use_news], outputs=[use_news])
         use_memes.change(update_memes, inputs=[use_memes], outputs=[use_memes])
         meme_frequency.change(update_meme_frequency, inputs=[meme_frequency], outputs=[meme_frequency])
-        
+
         return interface
 
 def start_bot():
@@ -2032,7 +2245,7 @@ if __name__ == "__main__":
     interface = create_ui()
     
     # Schedule Mork's haunting reply checker
-    schedule.every(3600).seconds.do(bot.monitor_and_reply_to_mentions)
+    schedule.every().day.at("10:00").do(bot.monitor_and_reply_to_mentions)
     threading.Thread(target=bot.scheduler_worker, daemon=True).start()
 
     print("🧠 Scheduler set. Launching Gradio...")
