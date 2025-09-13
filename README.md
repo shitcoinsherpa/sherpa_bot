@@ -1,6 +1,6 @@
-# AI Twitter Bot
+# AI Twitter Bot for Crypto
 
-This bot automatically posts about crypto or artificial intelligence news using AI personalities. It's like having your own crypto influencer that never sleeps.
+This bot automatically posts on X using AI personalities. It's like having your own influencer that never sleeps.
 
 ## What You Need
 - A computer (Windows, Mac, or Linux)
@@ -10,7 +10,7 @@ This bot automatically posts about crypto or artificial intelligence news using 
   2. Twitter/X developer account (for posting)
 
 ## Step 1: Get Your Keys
-You need two sets of keys. Here's how to get them:
+You need 3 sets of keys. Here's how to get them:
 
 ### OpenAI Key (for the AI brain)
 1. Go to https://platform.openai.com/api-keys
@@ -29,6 +29,8 @@ You need two sets of keys. Here's how to get them:
    - Access Token and Secret
 6. In your app settings, make sure to enable "Read and Write"
 
+### Telegram Key (for sharing tweets to Telegram)
+1. 
 ## Step 2: Install & Run
 
 ### On Windows:
@@ -83,7 +85,7 @@ You need two sets of keys. Here's how to get them:
 
 ## Step 3: Set Up Your Bot
 1. When the app opens, paste in your API keys
-2. Create an AI character (like "Angry Crypto Trader" or "Blockchain Prophet")
+2. Create an AI character (like "Leveraged Crypto Trader" or "Edgelord")
 3. Click "Enable Scheduler" to let it run automatically
 
 ## Important Notes
